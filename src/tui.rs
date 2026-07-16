@@ -1605,6 +1605,13 @@ fn command_menu() -> Selector {
 
 /// One-pick login: choose a provider; OAuth providers start the browser/device
 /// flow, API-key providers prefill the input so you can paste the key.
+/// Providers that support browser (OAuth) sign-in. They keep the full login
+/// picker so the user can choose browser vs. API key; every other provider is
+/// key-only and jumps straight to the masked key prompt.
+fn provider_supports_browser_login(provider: &str) -> bool {
+    matches!(provider, "anthropic" | "openai-codex" | "github-copilot")
+}
+
 fn login_selector(registry: &Registry) -> Selector {
     let curated = [
         ("Back to menu", "@menu"),
@@ -3579,14 +3586,28 @@ fn run_single_turn(
                 .filter(|p| !p.is_empty())
                 .map(str::to_string);
             if let Some(provider) = provider {
-                app.entries.push(Entry::new(
-                    Kind::System,
-                    format!(
-                        "🔑 Not signed in to {provider}. Pick a provider below to sign in — or \
-                         press Esc and switch to a model you have a key for with /model."
-                    ),
-                ));
-                app.selector = Some(login_selector(registry));
+                if provider_supports_browser_login(&provider) {
+                    app.entries.push(Entry::new(
+                        Kind::System,
+                        format!(
+                            "🔑 Not signed in to {provider}. Pick how to sign in below — or \
+                             press Esc and switch to a model you have a key for with /model."
+                        ),
+                    ));
+                    app.selector = Some(login_selector(registry));
+                } else {
+                    // Key-only provider: the model already named it, so skip the
+                    // provider picker and open the masked key prompt directly —
+                    // one paste-and-Enter connects.
+                    app.entries.push(Entry::new(
+                        Kind::System,
+                        format!(
+                            "🔑 Not signed in to {provider}. Paste your API key to connect — or \
+                             press Esc and switch to a model you have a key for with /model."
+                        ),
+                    ));
+                    app.prompt = Some(Prompt::for_command(&format!("/login {provider} ")));
+                }
             } else {
                 app.entries
                     .push(Entry::new(Kind::System, format!("Error: {message}")));
@@ -6053,6 +6074,20 @@ mod tests {
         let prompt = Prompt::for_command("/login kimi-coding ");
         assert!(prompt.masked);
         assert!(prompt.title.starts_with("Kimi Code"));
+    }
+
+    #[test]
+    fn key_only_providers_skip_the_picker_for_a_direct_key_prompt() {
+        // OAuth-capable providers keep the picker (browser vs. key choice).
+        assert!(provider_supports_browser_login("anthropic"));
+        assert!(provider_supports_browser_login("openai-codex"));
+        assert!(provider_supports_browser_login("github-copilot"));
+        // Key-only providers jump straight to the masked key prompt.
+        assert!(!provider_supports_browser_login("kimi-coding"));
+        assert!(!provider_supports_browser_login("openrouter"));
+        assert!(!provider_supports_browser_login("moonshotai"));
+        let prompt = Prompt::for_command("/login kimi-coding ");
+        assert!(prompt.masked, "key prompt must be masked");
     }
 
     #[test]
