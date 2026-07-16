@@ -401,7 +401,7 @@ impl AppConfig {
                     "anthropic/claude-opus-4-8".to_string(),
                     "openai/gpt-5.6-sol".to_string(),
                     "google/gemini-3.1-pro-preview".to_string(),
-                    "kimi-coding/kimi-for-coding".to_string(),
+                    "kimi-coding/k3".to_string(),
                 ]
             });
         let mut append_system_prompt = Vec::new();

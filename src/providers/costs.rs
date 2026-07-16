@@ -378,6 +378,7 @@ pub fn builtin_cost(provider: &str, id: &str) -> Option<ModelCost> {
         ("huggingface", "zai-org/GLM-5") => (1.0, 3.2, 0.2, 0.0),
         ("huggingface", "zai-org/GLM-5.1") => (1.0, 3.2, 0.2, 0.0),
         ("huggingface", "zai-org/GLM-5.2") => (1.4, 4.4, 0.0, 0.0),
+        ("kimi-coding", "k3") => (0.0, 0.0, 0.0, 0.0),
         ("kimi-coding", "k2p7") => (0.0, 0.0, 0.0, 0.0),
         ("kimi-coding", "kimi-for-coding") => (0.0, 0.0, 0.0, 0.0),
         ("kimi-coding", "kimi-k2-thinking") => (0.0, 0.0, 0.0, 0.0),

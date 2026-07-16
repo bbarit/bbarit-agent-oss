@@ -289,7 +289,7 @@ impl Registry {
             "fireworks" => &["accounts/fireworks/models/kimi-k2p6"],
             "together" => &["moonshotai/Kimi-K2.6"],
             "opencode" | "opencode-go" => &["kimi-k2.6"],
-            "kimi-coding" => &["kimi-for-coding"],
+            "kimi-coding" => &["k3", "kimi-for-coding"],
             "cloudflare-workers-ai" => &["@cf/moonshotai/kimi-k2.6"],
             "cloudflare-ai-gateway" => &["workers-ai/@cf/moonshotai/kimi-k2.6"],
             "xiaomi"
@@ -714,7 +714,7 @@ mod tests {
         let default = registry
             .default_model("kimi-coding")
             .expect("kimi-coding should have a default model");
-        assert_eq!(default.id, "kimi-for-coding");
+        assert_eq!(default.id, "k3");
     }
 
     #[test]
