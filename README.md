@@ -5,6 +5,10 @@
 <h1 align="center">bbarit-oss</h1>
 
 <p align="center">
+  <img src="assets/demo.gif" alt="bbarit-oss demo — the agent writes and runs code in your terminal" width="760" />
+</p>
+
+<p align="center">
   <strong>An open-source AI coding agent for your terminal — written in Rust, one binary, 15+ LLM providers, 1,000+ models.</strong>
 </p>
 
