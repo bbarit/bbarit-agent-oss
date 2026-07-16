@@ -1618,7 +1618,7 @@ fn login_selector(registry: &Registry) -> Selector {
         ("Back to menu", "@menu"),
         ("Logged-in accounts & usage", "/accounts"),
         ("Browser login (multi-account)", ""),
-        ("  Anthropic (Claude)", "/login anthropic"),
+        ("  Anthropic (Claude) — disabled", "/login anthropic"),
         ("  OpenAI Codex (ChatGPT)", "/login openai-codex"),
         ("  GitHub Copilot device login", "/login github-copilot"),
         ("API key", ""),

@@ -806,6 +806,9 @@ pub fn login_openai_codex_browser(config: &AppConfig) -> Result<String> {
     store_oauth_account(config, "openai-codex", credential)
 }
 
+// Disabled: /login anthropic no longer starts this flow (API keys only), but
+// the implementation is kept intact for re-enabling from commands::login.
+#[allow(dead_code)]
 pub fn login_anthropic_browser(config: &AppConfig) -> Result<String> {
     let client = Client::builder().build()?;
     let verifier = oauth_pkce_verifier();

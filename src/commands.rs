@@ -2060,14 +2060,15 @@ fn login(config: &AppConfig, rest: &str) -> Result<String> {
     let (provider, tail) = split_once(rest);
     if provider.is_empty() {
         bail!(
-            "usage: /login <provider> <key>  (e.g. /login anthropic sk-ant-...)\n       /login anthropic [browser] | /login github-copilot [enterprise-domain] | /login openai-codex [browser|device]"
+            "usage: /login <provider> <key>  (e.g. /login anthropic sk-ant-api03-...)\n       /login github-copilot [enterprise-domain] | /login openai-codex [browser|device]\n       /login anthropic [browser] is disabled — use an API key"
         );
     }
     let (kind, value) = split_once(tail);
     // Shorthand: `/login <provider> <key> [ENV=VALUE ...]` without the "api-key"
     // keyword. For API-key providers the second token is taken as the key; for
     // OAuth providers only when it clearly looks like a key (so `/login
-    // anthropic` / `/login anthropic browser` still start the OAuth flow).
+    // openai-codex` still starts the OAuth flow and `/login anthropic`
+    // reaches its disabled notice instead of being read as a key).
     let oauth_providers = ["anthropic", "openai-codex", "github-copilot"];
     let known_kinds = ["api-key", "browser", "device", "device_code"];
     let explicit_api_key = kind == "api-key";
@@ -2132,8 +2133,11 @@ fn login(config: &AppConfig, rest: &str) -> Result<String> {
             Ok(format!("Codex login complete — {summary}"))
         }
         ("anthropic", "") | ("anthropic", "browser") => {
-            let summary = crate::auth::login_anthropic_browser(config)?;
-            Ok(format!("Claude login complete — {summary}"))
+            // Claude browser OAuth is disabled, not removed — the flow stays
+            // in auth::login_anthropic_browser so it can be re-enabled here.
+            bail!(
+                "Claude browser login is disabled. Use an API key instead, e.g.\n  /login anthropic sk-ant-api03-...\n  /login anthropic api-key sk-ant-api03-..."
+            );
         }
         _ => bail!("unsupported login flow for {provider}. Use /login <provider> <key>."),
     }
@@ -6633,6 +6637,31 @@ mod tests {
                 .as_deref(),
             Some("sk-kimi-test-key")
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn login_anthropic_browser_is_disabled_but_api_key_still_works() {
+        let root = std::env::temp_dir().join(format!(
+            "bbarit-anthropic-login-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut config = AppConfig::for_test(root.clone());
+        config.auth_paths = vec![root.join("auth.json")];
+
+        // Browser OAuth entry points report disabled with an API-key example.
+        for input in ["anthropic", "anthropic browser"] {
+            let error = login(&config, input).unwrap_err().to_string();
+            assert!(error.contains("disabled"), "{error}");
+            assert!(error.contains("/login anthropic sk-ant-"), "{error}");
+        }
+
+        // The API-key path stays available.
+        let message = login(&config, "anthropic sk-ant-test-key").unwrap();
+        assert_eq!(message, "Stored API key for anthropic");
 
         let _ = fs::remove_dir_all(&root);
     }

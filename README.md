@@ -211,7 +211,8 @@ cd my-project && bbarit-oss
 
 # 2. First launch with no credentials opens the login picker automatically —
 #    pick a provider (OAuth in your browser, or paste an API key). Or any time:
-/login anthropic            # also: openai-codex, google, openrouter, groq, ...
+/login anthropic sk-ant-api03-...   # Claude API key (browser OAuth is disabled)
+/login openai-codex                 # also: github-copilot, google, openrouter, groq, ...
 
 # 3. Pick a model (optional — there's a sensible default)
 /model claude-sonnet-5
