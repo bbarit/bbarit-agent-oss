@@ -1557,6 +1557,7 @@ fn command_menu() -> Selector {
         ("  New skill (scaffold SKILL.md)", "/skill new "),
         ("  Computer use on/off (desktop control)", "/computer "),
         ("  Accounts & usage", "/accounts"),
+        ("  Upgrade to latest release", "/update"),
         ("  Switch model", "/model"),
         ("  Thinking level", "/thinking"),
         ("  Harness role models", "/roles"),
@@ -4051,7 +4052,39 @@ fn render(frame: &mut Frame, app: &mut App, partial: Option<&str>) {
     // on "  ·  ": project/branch leads in the accent, token counters recede,
     // the model (last segment) stays bold, and a PLAN segment warns in gold.
     {
-        let segments: Vec<&str> = app.status.split("  ·  ").collect();
+        // On narrow terminals Paragraph clips the right edge — exactly where
+        // the model lives — so it reads as "the model name never shows".
+        // Shed detail in reverse importance (account email, then the branch,
+        // then the model's provider prefix) until the line fits.
+        let mut segments: Vec<String> = app
+            .status
+            .split("  ·  ")
+            .map(|s| s.to_string())
+            .collect();
+        let width = menu_chunk.width as usize;
+        let too_wide = |segs: &[String]| {
+            segs.iter().map(|s| s.chars().count()).sum::<usize>()
+                + segs.len().saturating_sub(1) * 5
+                > width
+        };
+        if too_wide(&segments) && segments.len() > 1 {
+            segments.retain(|s| !s.contains('@'));
+        }
+        if too_wide(&segments) {
+            let first = usize::from(segments.first().is_some_and(|s| s.contains("PLAN")));
+            if let Some(project) = segments.get_mut(first) {
+                if let Some(idx) = project.find(" (") {
+                    project.truncate(idx);
+                }
+            }
+        }
+        if too_wide(&segments) {
+            if let Some(model) = segments.last_mut() {
+                if let Some(idx) = model.rfind('/') {
+                    *model = model[idx + 1..].to_string();
+                }
+            }
+        }
         let last = segments.len().saturating_sub(1);
         let mut spans: Vec<Span> = Vec::new();
         for (i, segment) in segments.iter().enumerate() {
@@ -4496,9 +4529,11 @@ fn status_line(store: &SessionStore, registry: &Registry, config: &AppConfig) ->
         .map(|email| format!("  ·  {email}"))
         .unwrap_or_default();
     // Cost ($) intentionally omitted — the per-model pricing isn't reliable yet.
+    // ↑ folds cache-creation tokens into input: on cache-heavy providers the raw
+    // input_tokens is a tiny remainder (↑2), which reads as "usage not counted".
     format!(
         " {plan}{project}{branch}  ·  ↑{} ↓{} R{}{context}  ·  {model}{account}",
-        fmt_tokens(usage.input),
+        fmt_tokens(usage.input + usage.cache_write),
         fmt_tokens(usage.output),
         fmt_tokens(usage.cache_read),
     )

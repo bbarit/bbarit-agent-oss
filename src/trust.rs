@@ -57,7 +57,12 @@ pub fn require_trusted(config: &AppConfig, operation: &str) -> Result<()> {
     if is_trusted(config)? {
         return Ok(());
     }
-    if atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout) {
+    // Inside the TUI stdin is in raw mode and owned by the event loop: a
+    // read_line() prompt can never receive the answer, and its print!() lands
+    // as garbage text over the composer. Fail with instructions instead — the
+    // error shows in the transcript and /trust yes unblocks.
+    let tui_active = ratatui::crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !tui_active && atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout) {
         return prompt_for_trust(config, operation);
     }
     let project = canonical(&config.cwd);

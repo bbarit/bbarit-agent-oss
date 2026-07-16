@@ -1292,7 +1292,10 @@ fn resolve_project_trusted(
     if let Some(decision) = read_project_trust_decision(user_app_dir, cwd)? {
         return Ok(decision);
     }
-    Ok(matches!(default_project_trust, Some("always")))
+    // Trust by default: asking on every new folder (or silently starting
+    // untrusted) was pure friction. An explicit /trust no still blocks a
+    // folder, and default_project_trust="never" restores ask-nothing-load-nothing.
+    Ok(!matches!(default_project_trust, Some("never")))
 }
 
 fn read_project_trust_decision(user_app_dir: &Path, cwd: &Path) -> Result<Option<bool>> {
