@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10]
+
+- Claude browser OAuth login (`/login anthropic`) is disabled. The flow is kept
+  in the codebase but the command and the login picker now point at API keys
+  instead, e.g. `/login anthropic sk-ant-api03-...`. Existing OAuth logins and
+  API-key logins keep working.
+
 ## [0.1.9]
 
 - `/model` now always saves the picked model as the launch default. It used to
