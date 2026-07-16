@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+vendor/semble/target/
+
+# Agent runtime/config directories
+/.pi/
+/.bbarit-agent/
+/.bbarit/
+
+# Prebuilt binaries staged for release
+/dist/
+
+# Node (npm wrapper)
+/node_modules/
+
+# OS cruft
+.DS_Store
