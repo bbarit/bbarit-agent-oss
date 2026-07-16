@@ -4056,15 +4056,10 @@ fn render(frame: &mut Frame, app: &mut App, partial: Option<&str>) {
         // the model lives — so it reads as "the model name never shows".
         // Shed detail in reverse importance (account email, then the branch,
         // then the model's provider prefix) until the line fits.
-        let mut segments: Vec<String> = app
-            .status
-            .split("  ·  ")
-            .map(|s| s.to_string())
-            .collect();
+        let mut segments: Vec<String> = app.status.split("  ·  ").map(|s| s.to_string()).collect();
         let width = menu_chunk.width as usize;
         let too_wide = |segs: &[String]| {
-            segs.iter().map(|s| s.chars().count()).sum::<usize>()
-                + segs.len().saturating_sub(1) * 5
+            segs.iter().map(|s| s.chars().count()).sum::<usize>() + segs.len().saturating_sub(1) * 5
                 > width
         };
         if too_wide(&segments) && segments.len() > 1 {
