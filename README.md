@@ -586,7 +586,14 @@ set `BBARIT_AUTO_UPGRADE=1`; to turn the check off, set `BBARIT_NO_UPDATE_CHECK=
 | Local models (Ollama) | ✅ | ❌ | ❌ | ❌ |
 | Built-in personas | ✅ 295 | ❌ | ❌ | ❌ |
 | Semantic code search | ✅ bundled | ❌ | ❌ | ❌ |
+| Cross-session auto-memory | ✅ | ❌ | ❌ | ❌ |
+| Project wiki | ✅ | ❌ | ❌ | ❌ |
+| Parallel sub-agents | ✅ multi-process | ❌ | ❌ | ❌ |
+| Reuse Claude Code + Codex MCP/skills | ✅ `/interop` | — | — | — |
 | MCP support | ✅ | ✅ | ✅ | ✅ |
+| Self-update (`--upgrade`) | ✅ every platform | ✅ | ✅ | ✅ |
+
+> Also compared to **[Pi](https://github.com/earendil-works/pi)** (our MIT upstream, TypeScript/Node): bbarit-oss keeps Pi's small, legible core but rewrites it in **Rust** (single binary, no runtime) and adds the orchestrator, wiki, personas, auto-memory, and interop that Pi doesn't have — see [PROVENANCE.md](./PROVENANCE.md) for the exact overlap.
 
 ## How it works
 
@@ -626,7 +633,30 @@ a single Rust binary with no runtime.
 **Is it related to Pi?**
 Yes — its design is based on [Pi](https://github.com/earendil-works/pi) (MIT). It
 is an independent Rust rewrite; we publish the exact measured source overlap and
-the full list of differences in [PROVENANCE.md](./PROVENANCE.md).
+the full list of differences in [PROVENANCE.md](./PROVENANCE.md). If you found Pi
+and want a single-binary, multi-provider version, bbarit-oss is it.
+
+**Which LLM providers are supported?**
+Anthropic Claude, OpenAI (GPT + Codex), Google Gemini / Vertex, OpenRouter, Groq,
+Mistral, Together, Fireworks, DeepSeek, Cerebras, Amazon Bedrock, GitHub Copilot,
+and local models via **Ollama** — 15+ providers, 1,000+ models from one registry.
+
+**Can I use it with a local model / offline?**
+Yes. Point it at **Ollama** (`/ollama`) to run entirely on your machine — no API
+key, no data leaving your computer.
+
+**Is it free?**
+The agent is free and open source (MIT). You only pay your own LLM provider (or
+run a local model for $0).
+
+**How do I install it on Windows?**
+Download `bbarit-oss-windows-x64.exe` from the
+[releases page](https://github.com/bbarit/bbarit-agent-oss/releases); `--upgrade`
+self-updates it in place. macOS/Linux use `curl … | sh`.
+
+**Is my code private?**
+Yes — your keys and code stay on your machine and go only to the provider you
+choose. It is fully self-hostable; nothing routes through us.
 
 **`bbarit-oss: command not found` after install.**
 Add the install directory to your `PATH`: `export PATH="$HOME/.local/bin:$PATH"`.
