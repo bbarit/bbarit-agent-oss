@@ -1,0 +1,111 @@
+name: release
+
+# Build prebuilt binaries for every platform on a version tag, publish a GitHub
+# Release, and (optionally) deploy the binaries + latest.json to bbarit.com so
+# `curl … | sh` and `bbarit --upgrade` both work.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_key: macos-arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+          - target_key: macos-x64
+            os: macos-14
+            rust_target: x86_64-apple-darwin
+          - target_key: linux-x64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+          - target_key: linux-arm64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+          - target_key: windows-x64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target ${{ matrix.rust_target }}
+      - name: Stage artifact (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.rust_target }}/release/bbarit-oss" "dist/bbarit-oss-${{ matrix.target_key }}"
+      - name: Stage artifact (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.rust_target }}/release/bbarit-oss.exe" "dist/bbarit-oss-${{ matrix.target_key }}.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbarit-oss-${{ matrix.target_key }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          merge-multiple: true
+      - name: Build latest.json manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://bbarit.com/agent/dist/$VERSION"
+          {
+            echo "{"
+            echo "  \"version\": \"$VERSION\","
+            echo "  \"targets\": {"
+            echo "    \"macos-arm64\": \"$BASE/bbarit-oss-macos-arm64\","
+            echo "    \"macos-x64\":   \"$BASE/bbarit-oss-macos-x64\","
+            echo "    \"linux-x64\":   \"$BASE/bbarit-oss-linux-x64\","
+            echo "    \"linux-arm64\": \"$BASE/bbarit-oss-linux-arm64\","
+            echo "    \"windows-x64\": \"$BASE/bbarit-oss-windows-x64.exe\""
+            echo "  }"
+            echo "}"
+          } > staging/latest.json
+          cat staging/latest.json
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: staging/*
+          generate_release_notes: true
+      - name: Deploy to bbarit.com (skipped if secrets are unset)
+        env:
+          SSH_KEY: ${{ secrets.BBARIT_SSH_KEY }}
+          SSH_HOST: ${{ secrets.BBARIT_SSH_HOST }}
+          SSH_USER: ${{ secrets.BBARIT_SSH_USER }}
+          REMOTE_ROOT: ${{ secrets.BBARIT_AGENT_ROOT }}
+        run: |
+          if [ -z "$SSH_KEY" ]; then
+            echo "BBARIT_SSH_KEY not set — skipping bbarit.com deploy (GitHub Release still published)."
+            exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p ~/.ssh && echo "$SSH_KEY" > ~/.ssh/id && chmod 600 ~/.ssh/id
+          ssh -i ~/.ssh/id -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "mkdir -p $REMOTE_ROOT/dist/$VERSION"
+          # Binaries first, manifest last: latest.json only ever points at
+          # binaries that are already in place. A failure here must turn the
+          # job red — install.sh and --upgrade read ONLY bbarit.com, so a
+          # green run with a failed deploy would silently strand users.
+          scp -i ~/.ssh/id -o StrictHostKeyChecking=no staging/bbarit-oss-* "$SSH_USER@$SSH_HOST:$REMOTE_ROOT/dist/$VERSION/"
+          scp -i ~/.ssh/id -o StrictHostKeyChecking=no staging/latest.json install.sh "$SSH_USER@$SSH_HOST:$REMOTE_ROOT/"
