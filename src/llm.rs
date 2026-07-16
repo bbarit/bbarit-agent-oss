@@ -3320,7 +3320,31 @@ fn xml_escape_text(text: &str) -> String {
 /// appended. The date is taken from the system clock, not from the model.
 /// A summary of the project wiki (.bbarit/wiki/) for the system prompt, so the model
 /// knows what is already documented and where to record new findings.
+/// `(built_at, cwd, block)` — the wiki summary cached per working directory.
+type WikiBlockCache =
+    std::sync::Mutex<Option<(std::time::Instant, std::path::PathBuf, Option<String>)>>;
+
 fn project_wiki_block(config: &AppConfig) -> Option<String> {
+    // Cached for a few seconds: the wiki only changes via the `wiki` tool, so
+    // re-walking the note vault on every per-turn system-prompt build is wasted
+    // I/O (same reasoning as the skills cache).
+    static CACHE: std::sync::OnceLock<WikiBlockCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((at, cwd, block)) = guard.as_ref()
+        && *cwd == config.cwd
+        && at.elapsed() < std::time::Duration::from_secs(5)
+    {
+        return block.clone();
+    }
+    let block = build_project_wiki_block(config);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), config.cwd.clone(), block.clone()));
+    }
+    block
+}
+
+fn build_project_wiki_block(config: &AppConfig) -> Option<String> {
     let wiki = crate::wiki::Wiki::open(&config.app_dir, &config.cwd).ok()?;
     let pages = wiki.list().ok()?;
     if pages.is_empty() {
