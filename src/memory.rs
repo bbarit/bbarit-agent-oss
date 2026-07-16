@@ -27,6 +27,7 @@ fn memory_dir(config: &AppConfig) -> PathBuf {
     config.user_app_dir.join("memory")
 }
 
+#[derive(Clone)]
 struct MemoryFile {
     name: String,
     description: String,
@@ -95,6 +96,30 @@ fn load_memory_files(config: &AppConfig) -> Vec<MemoryFile> {
     out
 }
 
+/// `(built_at, memory_dir, files)` — parsed memory files cached per directory.
+type MemoryCache = std::sync::Mutex<Option<(std::time::Instant, PathBuf, Vec<MemoryFile>)>>;
+
+/// Like `load_memory_files`, but cached for a few seconds: memories change only
+/// via `/memory` or auto-extraction, so re-reading and re-parsing every file on
+/// each turn's recall is wasted I/O (same reasoning as the wiki/skills caches).
+fn cached_memory_files(config: &AppConfig) -> Vec<MemoryFile> {
+    static CACHE: std::sync::OnceLock<MemoryCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let dir = memory_dir(config);
+    if let Ok(guard) = cache.lock()
+        && let Some((at, cached_dir, files)) = guard.as_ref()
+        && *cached_dir == dir
+        && at.elapsed() < std::time::Duration::from_secs(5)
+    {
+        return files.clone();
+    }
+    let files = load_memory_files(config);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), dir, files.clone()));
+    }
+    files
+}
+
 /// Split a prompt into distinct lowercase words of at least 3 characters — the
 /// terms recall scores memories against.
 fn prompt_terms(prompt: &str) -> Vec<String> {
@@ -130,7 +155,7 @@ pub fn recall(config: &AppConfig, prompt: &str, max: usize) -> Vec<String> {
     if terms.is_empty() {
         return Vec::new();
     }
-    let mut scored: Vec<(usize, MemoryFile)> = load_memory_files(config)
+    let mut scored: Vec<(usize, MemoryFile)> = cached_memory_files(config)
         .into_iter()
         .map(|mem| (score_memory(&mem, &terms), mem))
         .filter(|(score, _)| *score > 0)
@@ -139,8 +164,20 @@ pub fn recall(config: &AppConfig, prompt: &str, max: usize) -> Vec<String> {
     scored
         .into_iter()
         .take(max)
-        .map(|(_, mem)| mem.body)
+        .map(|(_, mem)| cap_body(mem.body))
         .collect()
+}
+
+/// Recalled bodies ride along in every turn's (uncached) user message, so cap an
+/// individual memory so one runaway note can't bloat the context; curated facts
+/// sit far under this.
+fn cap_body(body: String) -> String {
+    const MAX: usize = 1500;
+    if body.chars().count() <= MAX {
+        return body;
+    }
+    let head: String = body.chars().take(MAX).collect();
+    format!("{head}\n…(memory truncated)")
 }
 
 struct ExtractedMemory {
