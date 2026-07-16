@@ -1,0 +1,48 @@
+[package]
+name = "bbarit-oss"
+version = "0.1.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+arboard = "3"
+atty = "0.2"
+base64 = "0.22"
+png = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+dirs-next = "2.0"
+hex = "0.4"
+hmac = "0.12"
+# gitignore-aware directory walking for find/grep/tree/ls (ripgrep's engine).
+ignore = "0.4"
+# Real syntax highlighting for code fences and read-output in the TUI
+# (pure-Rust fancy-regex build — no C oniguruma dependency).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+ratatui = "0.29"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rsa = { version = "0.9", features = ["sha2"] }
+semble = { path = "vendor/semble" }
+# Aligned to the host app (src-tauri) rusqlite version so the two crates share a
+# single bundled libsqlite3-sys when the agent is embedded — two `bundled` copies
+# would clash on duplicate sqlite3 C symbols at link time.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+terminal_size = "0.4"
+tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+unicode-normalization = "0.1"
+unicode-width = "0.2"
+urlencoding = "2.1"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+enigo = "0.6.1"
+
+
+# stderr → 로그파일 리다이렉트(fd 2 dup2/dup)용 — TUI(raw mode) 화면 오염 방지.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
