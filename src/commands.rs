@@ -4326,14 +4326,14 @@ pub fn provider_has_credentials(registry: &Registry, config: &AppConfig, provide
         .unwrap_or(false)
 }
 
-/// Persist the model as the launch default only when its provider has
-/// credentials, and warn (without stranding the default) when it does not.
+/// Persist the model as the launch default and warn when its provider has no
+/// credentials yet. Persisting must not depend on the key being present: the
+/// login prompt opens right after a keyless switch, and skipping the save made
+/// the chosen model silently revert on the next launch ("model doesn't save").
 fn finalize_model_set(registry: &Registry, config: &AppConfig, selected: &SelectedModel) -> String {
     let provider = &selected.model.provider;
     let has_key = provider_has_credentials(registry, config, provider);
-    if has_key {
-        let _ = crate::config::persist_default_model(provider, &selected.model.id);
-    }
+    let _ = crate::config::persist_default_model(provider, &selected.model.id);
     let mut message = format!(
         "Model set: {}/{} ({}) thinking={}",
         provider,
@@ -4344,7 +4344,7 @@ fn finalize_model_set(registry: &Registry, config: &AppConfig, selected: &Select
     if !has_key {
         message.push_str(&format!(
             "\n⚠ No API key for '{provider}' — turns will fail. Add it with /login {provider} <key>, \
-             or pick a model you have access to (/model openai-codex, /ollama). Not saved as default."
+             or pick a model you have access to (/model openai-codex, /ollama)."
         ));
     }
     message

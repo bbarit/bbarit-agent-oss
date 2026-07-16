@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.9]
+
+- `/model` now always saves the picked model as the launch default. It used to
+  skip the save when the provider had no API key yet (the login prompt opens
+  right after), so the choice silently reverted on the next launch — "model
+  switching doesn't save".
+- Esc now interrupts MCP server startup handshakes. A slow or broken MCP entry
+  (including ones inherited from Claude Code's `~/.claude.json` via interop)
+  could pin the start of a turn for its full timeout while ignoring
+  cancellation. A cancelled handshake is not marked failed, so the server
+  retries normally on the next turn.
+
 ## [0.1.6]
 
 - Esc now cancels promptly even while the model is "thinking" and streaming

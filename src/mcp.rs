@@ -369,11 +369,27 @@ impl Server {
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         writeln!(self.stdin, "{}", serde_json::to_string(&msg)?)?;
         self.stdin.flush()?;
+        // Wait in short slices so Esc interrupts a slow server handshake — a
+        // broken/slow entry otherwise pins the turn for the full timeout while
+        // the UI shows "cancelling…" and appears to ignore Esc.
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            let value = self
+            if crate::commands::cancel_requested() {
+                bail!("MCP request `{method}` cancelled");
+            }
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| anyhow!("MCP request `{method}` timed out"))?;
+            let value = match self
                 .rx
-                .recv_timeout(timeout)
-                .map_err(|_| anyhow!("MCP request `{method}` timed out"))?;
+                .recv_timeout(remaining.min(Duration::from_millis(200)))
+            {
+                Ok(value) => value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("MCP request `{method}` timed out")
+                }
+            };
             if value.get("id").and_then(Value::as_i64) == Some(id) {
                 if let Some(err) = value.get("error") {
                     bail!("MCP `{method}` error: {err}");
@@ -531,6 +547,11 @@ pub fn mcp_tool_specs(config: &AppConfig) -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     for (name, cfg) in &configs {
         if !map.contains_key(name) {
+            // Esc mid-startup: stop spawning the remaining servers so the turn
+            // ends promptly instead of paying every handshake timeout first.
+            if crate::commands::cancel_requested() {
+                break;
+            }
             if failed_servers().lock().unwrap().contains(name) {
                 continue;
             }
@@ -539,6 +560,11 @@ pub fn mcp_tool_specs(config: &AppConfig) -> Vec<ToolSpec> {
                     map.insert(name.clone(), server);
                 }
                 Err(error) => {
+                    // A cancelled handshake is not a broken server — leave it
+                    // untombstoned so the next turn retries it normally.
+                    if crate::commands::cancel_requested() {
+                        break;
+                    }
                     failed_servers().lock().unwrap().insert(name.clone());
                     crate::llm::emit_activity(&format!(
                         "⚠ MCP server `{name}` failed to start ({error:#}) — skipping it for \
