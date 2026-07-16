@@ -369,6 +369,10 @@ across id, name, and description).
 | Video production | 4 | `cinematographer`, `live-stream-pd` |
 | Writing & translation | 4 | `book-author-coach`, `speech-writer` |
 
+**Source & license.** The persona briefs are adapted from
+[AgentLand](./personas/LICENSE) (MIT, © 2025 AgentLand Contributors); the persona
+*system* around them (injection, read-only mode, picker, overrides) is our own.
+
 **How a persona is defined.** Each persona is a markdown file at
 `personas/<division>/<id>.md`. The file stem is its stable id, the parent
 directory is its division, and the frontmatter carries `name`, `description`,

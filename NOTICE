@@ -37,5 +37,12 @@ auto-memory design. qwen-code is licensed under the Apache License, Version 2.0.
 You may obtain a copy of the license at http://www.apache.org/licenses/LICENSE-2.0
 
 --------------------------------------------------------------------------------
+Persona library (personas/) — AgentLand
+
+The 295 built-in personas are adapted from AgentLand, MIT License,
+Copyright (c) 2025 AgentLand Contributors. The full license text is preserved
+verbatim in personas/LICENSE.
+
+--------------------------------------------------------------------------------
 Bundled dependency: semble (vendor/semble)
 https://github.com/johunsang/semble_rs — MIT License

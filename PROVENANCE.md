@@ -78,7 +78,7 @@ presence** in the Pi source:
 
 | Feature | What it is |
 |---|---|
-| **Persona system** | 295 curated specialist personas across 32 domains, selectable with `--persona` / `/persona`, injected at startup. |
+| **Persona system** | 295 curated specialist personas across 30 domains, selectable with `--persona` / `/persona`, injected at startup. |
 | **Built-in wiki** | A per-project knowledge base (`wiki.rs`). |
 | **Bundled semantic code search** | Vendors the `semble` engine for a `code_search` tool and a background-warmed code index — hybrid BM25 + semantic, over the project. |
 | **Computer-use tool** | Opt-in screenshot + mouse/keyboard control (`computer.rs`). |
@@ -146,6 +146,14 @@ durable-fact taxonomy (`user` / `feedback` / `project` / `reference`) and the
 `MEMORY.md` index concept come from there. The Rust implementation and its
 prompts were written independently. qwen-code's attribution is recorded in
 [`NOTICE`](./NOTICE).
+
+## Persona library
+
+The 295 built-in personas (`personas/`) are adapted from **AgentLand** (MIT
+License, © 2025 AgentLand Contributors). The persona *system* — startup
+injection, read-only mode, the picker, and per-project overrides — is our own;
+the persona *briefs* originate with AgentLand. AgentLand's MIT license text is
+preserved verbatim in [`personas/LICENSE`](./personas/LICENSE).
 
 ## License compliance
 
