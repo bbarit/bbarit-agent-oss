@@ -155,39 +155,84 @@ fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Result<Pro
     Ok(parse_codex_usage(&response))
 }
 
-/// The wham/usage payload has shipped in both snake_case and camelCase.
+/// The wham/usage payload has shipped in three shapes so far: the current
+/// `rate_limit.{primary,secondary}_window` (seconds + reset_at) plus
+/// `additional_rate_limits[]` per metered model family, and two legacy forms
+/// (`rate_limits.primary` in snake_case and camelCase, minutes-based).
 fn parse_codex_usage(value: &Value) -> ProviderUsage {
-    let limits = ["rate_limits", "rateLimits"]
-        .iter()
-        .map(|key| &value[*key])
-        .find(|node| !node.is_null())
-        .unwrap_or(&Value::Null);
     let mut windows = Vec::new();
-    for key in ["primary", "secondary"] {
-        let window = &limits[key];
-        let Some(used) = window["used_percent"]
-            .as_f64()
-            .or_else(|| window["usedPercent"].as_f64())
-        else {
-            continue;
-        };
-        let minutes = window["window_minutes"]
-            .as_i64()
-            .or_else(|| window["windowDurationMins"].as_i64());
-        let resets_at = window["resets_at"]
-            .as_i64()
-            .or_else(|| window["resetsAt"].as_i64());
-        windows.push(UsageWindow {
-            label: codex_window_label(minutes),
-            used_percent: used,
-            resets_at,
-        });
+
+    // Current schema.
+    let rate_limit = &value["rate_limit"];
+    if !rate_limit.is_null() {
+        for key in ["primary_window", "secondary_window"] {
+            push_codex_seconds_window(&rate_limit[key], None, &mut windows);
+        }
+        if let Some(extra) = value["additional_rate_limits"].as_array() {
+            for item in extra {
+                let name = item["limit_name"].as_str();
+                push_codex_seconds_window(
+                    &item["rate_limit"]["primary_window"],
+                    name,
+                    &mut windows,
+                );
+            }
+        }
     }
+
+    // Legacy schemas.
+    if windows.is_empty() {
+        let limits = ["rate_limits", "rateLimits"]
+            .iter()
+            .map(|key| &value[*key])
+            .find(|node| !node.is_null())
+            .unwrap_or(&Value::Null);
+        for key in ["primary", "secondary"] {
+            let window = &limits[key];
+            let Some(used) = window["used_percent"]
+                .as_f64()
+                .or_else(|| window["usedPercent"].as_f64())
+            else {
+                continue;
+            };
+            let minutes = window["window_minutes"]
+                .as_i64()
+                .or_else(|| window["windowDurationMins"].as_i64());
+            let resets_at = window["resets_at"]
+                .as_i64()
+                .or_else(|| window["resetsAt"].as_i64());
+            windows.push(UsageWindow {
+                label: codex_window_label(minutes),
+                used_percent: used,
+                resets_at,
+            });
+        }
+    }
+
     let plan = value["plan_type"]
         .as_str()
         .or_else(|| value["planType"].as_str())
         .map(ToOwned::to_owned);
     ProviderUsage { plan, windows }
+}
+
+/// One window of the current wham schema (seconds-based). `name` labels the
+/// per-model additional limits, e.g. "week GPT-5.3-Codex-Spark".
+fn push_codex_seconds_window(window: &Value, name: Option<&str>, out: &mut Vec<UsageWindow>) {
+    let Some(used) = window["used_percent"].as_f64() else {
+        return;
+    };
+    let minutes = window["limit_window_seconds"].as_i64().map(|s| s / 60);
+    let resets_at = window["reset_at"].as_i64();
+    let mut label = codex_window_label(minutes);
+    if let Some(name) = name {
+        label = format!("{label} {name}");
+    }
+    out.push(UsageWindow {
+        label,
+        used_percent: used,
+        resets_at,
+    });
 }
 
 fn codex_window_label(minutes: Option<i64>) -> String {
@@ -288,6 +333,45 @@ mod tests {
         assert!((usage.windows[0].used_percent - 32.5).abs() < f64::EPSILON);
         assert!(usage.windows[0].resets_at.is_some());
         assert_eq!(usage.windows[1].label, "week");
+    }
+
+    #[test]
+    fn parses_codex_usage_current_wham_schema() {
+        // Real shape as of 2026-07: singular rate_limit, *_window, seconds,
+        // reset_at, plus per-model additional_rate_limits.
+        let value = json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 9.0,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 518620,
+                    "reset_at": 1784835807
+                },
+                "secondary_window": null
+            },
+            "additional_rate_limits": [
+                {
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 0.0,
+                            "limit_window_seconds": 604800,
+                            "reset_at": 1784922009
+                        }
+                    }
+                }
+            ]
+        });
+        let usage = parse_codex_usage(&value);
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[0].label, "week");
+        assert!((usage.windows[0].used_percent - 9.0).abs() < f64::EPSILON);
+        assert_eq!(usage.windows[0].resets_at, Some(1784835807));
+        assert_eq!(usage.windows[1].label, "week GPT-5.3-Codex-Spark");
+        assert_eq!(usage.plan.as_deref(), Some("pro"));
     }
 
     #[test]
