@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.13]
+
+- Reduce per-turn token use by tightening harness role prompts, trimming
+  redundant request setup, and keeping app-only tool hints out of the
+  standalone OSS agent.
+- Restore Codex usage reporting for the current usage payload schema.
+- Make cancellation interrupt long-running web tools promptly instead of
+  waiting for the network operation to finish.
+- Ship smaller release binaries with size optimization, LTO, and stripped
+  symbols.
+- Harden MCP reload tests against parallel global-state updates and clean up
+  DuckDuckGo result-link decoding.
+
 ## [0.1.12]
 
 - Windows one-line install: `irm https://bbarit.com/agent/install.ps1 | iex`
