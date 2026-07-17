@@ -48,3 +48,12 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
+
+# Ship a compact binary: strip symbols, whole-program LTO, size-tuned codegen.
+# panic stays "unwind" so an unexpected panic in a worker thread doesn't abort
+# the whole interactive session.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
