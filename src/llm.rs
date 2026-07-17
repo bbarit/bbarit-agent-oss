@@ -4750,7 +4750,7 @@ fn extract_openai_responses_text(response: &Value) -> Result<String> {
 
 fn openai_responses_usage(response: &Value) -> Option<TokenUsage> {
     let usage = &response["usage"];
-    usage_from_values(
+    openai_usage_from_values(
         token_value(usage, &["input_tokens", "prompt_tokens"]),
         token_value(usage, &["output_tokens", "completion_tokens"]),
         token_value(
@@ -4775,7 +4775,7 @@ fn openai_responses_usage(response: &Value) -> Option<TokenUsage> {
 
 fn openai_chat_usage(response: &Value) -> Option<TokenUsage> {
     let usage = &response["usage"];
-    usage_from_values(
+    openai_usage_from_values(
         token_value(usage, &["prompt_tokens", "input_tokens"]),
         token_value(usage, &["completion_tokens", "output_tokens"]),
         token_value(
@@ -4796,6 +4796,21 @@ fn openai_chat_usage(response: &Value) -> Option<TokenUsage> {
         ),
         token_value(usage, &["total_tokens"]),
     )
+}
+
+/// OpenAI reports cached prompt tokens as a subset of input/prompt tokens.
+/// Internally `TokenUsage.input` means uncached input because cost and context
+/// accounting add `cache_read` separately. Normalize once at the API boundary
+/// so cached tokens are neither billed nor displayed twice.
+fn openai_usage_from_values(
+    input_including_cache: Option<usize>,
+    output: Option<usize>,
+    cache_read: Option<usize>,
+    cache_write: Option<usize>,
+    total: Option<usize>,
+) -> Option<TokenUsage> {
+    let input = input_including_cache.map(|value| value.saturating_sub(cache_read.unwrap_or(0)));
+    usage_from_values(input, output, cache_read, cache_write, total)
 }
 
 fn anthropic_usage(response: &Value) -> Option<TokenUsage> {
@@ -5342,6 +5357,78 @@ fn finalize_tool_arguments(name: &str, partial: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_cached_tokens_are_not_counted_twice() {
+        let responses = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 40},
+                "total_tokens": 120
+            }
+        });
+        let responses_usage = openai_responses_usage(&responses).unwrap();
+        assert_eq!(responses_usage.input, 60);
+        assert_eq!(responses_usage.cache_read, 40);
+        assert_eq!(responses_usage.output, 20);
+        assert_eq!(responses_usage.total, 120);
+
+        let chat = json!({
+            "usage": {
+                "prompt_tokens": 75,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 25},
+                "total_tokens": 80
+            }
+        });
+        let usage = openai_chat_usage(&chat).unwrap();
+        assert_eq!(usage.input, 50);
+        assert_eq!(usage.cache_read, 25);
+        assert_eq!(usage.total, 80);
+
+        let price = crate::providers::ModelCost {
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.5,
+            cache_write: 0.0,
+        };
+        let cost = price.cost_for(
+            responses_usage.input,
+            responses_usage.output,
+            responses_usage.cache_read,
+            responses_usage.cache_write,
+        );
+        assert!((cost - 0.000_34).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn openai_usage_normalization_handles_missing_and_invalid_cache_details() {
+        let uncached = json!({
+            "usage": {"prompt_tokens": 75, "completion_tokens": 5}
+        });
+        let usage = openai_chat_usage(&uncached).unwrap();
+        assert_eq!(usage.input, 75);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.total, 80);
+
+        // Defensive saturation: a malformed provider response must not wrap
+        // usize when cached_tokens exceeds the inclusive prompt count.
+        let malformed = json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 20},
+                "total_tokens": 12
+            }
+        });
+        let usage = openai_responses_usage(&malformed).unwrap();
+        assert_eq!(usage.input, 0);
+        assert_eq!(usage.cache_read, 20);
+        assert_eq!(usage.total, 12);
+    }
+
     #[test]
     fn codex_websocket_dial_errors_fast_on_closed_port() {
         use tungstenite::client::IntoClientRequest;
@@ -5389,8 +5476,6 @@ mod tests {
             json!("string")
         );
     }
-
-    use super::*;
 
     #[test]
     fn sanitize_tool_parameters_drops_root_union_on_object() {
@@ -5788,7 +5873,7 @@ mod tests {
         assert_eq!(
             openai_chat_usage(&openai),
             Some(TokenUsage {
-                input: 10,
+                input: 7,
                 output: 5,
                 cache_read: 3,
                 cache_write: 0,

@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,6 +22,34 @@ const MAX_READ_LINES: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 const DEFAULT_GREP_MATCHES: usize = 100;
 const DEFAULT_FIND_MATCHES: usize = 1000;
+
+/// Full schemas for specialist built-ins are loaded on demand. The core set is
+/// deliberately small but sufficient to inspect, edit, run, and plan without a
+/// discovery round trip.
+pub const FIND_BUILTIN_TOOLS_NAME: &str = "tool_search";
+const CORE_BUILTIN_TOOLS: &[&str] = &[
+    "read",
+    "read_many",
+    "bash",
+    "job",
+    "write",
+    "edit",
+    "patch",
+    "grep",
+    "find",
+    "ls",
+    "code_search",
+    "code_deps",
+    "code_plan",
+    "todo",
+];
+
+static ACTIVATED_BUILTIN_TOOLS: std::sync::OnceLock<Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn activated_builtin_tools() -> &'static Mutex<HashSet<String>> {
+    ACTIVATED_BUILTIN_TOOLS.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
@@ -596,6 +625,103 @@ pub fn built_in_tool_specs() -> Vec<ToolSpec> {
     specs
 }
 
+fn available_builtin_tool_specs(config: &AppConfig) -> Vec<ToolSpec> {
+    built_in_tool_specs()
+        .into_iter()
+        .filter(|tool| tool_enabled(config, &tool.name))
+        .filter(|tool| tool.name != "computer" || crate::computer::computer_use_enabled())
+        .collect()
+}
+
+fn lazy_builtin_tool_specs(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    let activated = activated_builtin_tools().lock().unwrap();
+    let mut index = String::new();
+    let mut kept = Vec::new();
+    for spec in specs {
+        if CORE_BUILTIN_TOOLS.contains(&spec.name.as_str()) || activated.contains(&spec.name) {
+            kept.push(spec);
+        } else {
+            let compact = spec
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let summary: String = compact.chars().take(100).collect();
+            index.push_str(&format!("\n- {}: {}", spec.name, summary));
+        }
+    }
+    drop(activated);
+    if !index.is_empty() {
+        let mut finder = ToolSpec::new(
+            FIND_BUILTIN_TOOLS_NAME,
+            &format!(
+                "Load deferred built-in tools. The tools below are available but their schemas are not loaded, so they cannot be called until loaded. Pass a short keyword query; matching tools become callable. Deferred tools:{index}"
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "keywords matching tool names or descriptions"}
+                },
+                "required": ["query"]
+            }),
+        );
+        finder.prompt_snippet = Some(
+            "loads specialist built-in tools only when the current task needs them".to_string(),
+        );
+        kept.push(finder);
+    }
+    kept
+}
+
+/// Activate up to eight deferred built-ins matching `query`. The next agent
+/// round rebuilds the tool list with their full schemas.
+pub fn find_builtin_tools(config: &AppConfig, query: &str) -> Result<String> {
+    let scored = matching_deferred_builtin_tools(available_builtin_tool_specs(config), query);
+    if scored.is_empty() {
+        return Ok(format!(
+            "No deferred built-in tools match `{query}`. Try broader keywords."
+        ));
+    }
+    let mut activated = activated_builtin_tools().lock().unwrap();
+    let mut out = String::from("Loaded built-in tools (now callable):\n");
+    for spec in scored {
+        activated.insert(spec.name.clone());
+        out.push_str(&format!(
+            "\n## {}\n{}\nInput schema: {}\n",
+            spec.name, spec.description, spec.parameters
+        ));
+    }
+    Ok(out)
+}
+
+fn matching_deferred_builtin_tools(specs: Vec<ToolSpec>, query: &str) -> Vec<ToolSpec> {
+    let tokens: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect();
+    let normalized_query = query.trim().to_lowercase();
+    let mut scored = specs
+        .into_iter()
+        .filter(|spec| !CORE_BUILTIN_TOOLS.contains(&spec.name.as_str()))
+        .filter_map(|spec| {
+            let haystack = format!("{} {}", spec.name, spec.description).to_lowercase();
+            let mut score = tokens
+                .iter()
+                .filter(|token| haystack.contains(*token))
+                .count();
+            if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
+                score += 4;
+            }
+            (score > 0 || tokens.is_empty()).then_some((score, spec))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(8);
+    scored.into_iter().map(|(_, spec)| spec).collect()
+}
+
 pub fn configured_tool_specs(config: &AppConfig, enable_tools: bool) -> Vec<ToolSpec> {
     if !enable_tools || config.no_tools {
         return Vec::new();
@@ -603,12 +729,7 @@ pub fn configured_tool_specs(config: &AppConfig, enable_tools: bool) -> Vec<Tool
     let mut specs = if config.no_builtin_tools {
         Vec::new()
     } else {
-        built_in_tool_specs()
-            .into_iter()
-            .filter(|tool| tool_enabled(config, &tool.name))
-            // Computer use is opt-in — not exposed to the model before /computer on.
-            .filter(|tool| tool.name != "computer" || crate::computer::computer_use_enabled())
-            .collect::<Vec<_>>()
+        lazy_builtin_tool_specs(available_builtin_tool_specs(config))
     };
     if let Ok(extension_tools) = crate::extensions::load_extension_tool_specs(config) {
         for tool in extension_tools
@@ -4849,6 +4970,134 @@ fn wildcard_match(value: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specialist_builtin_schemas_are_deferred() {
+        let visible = lazy_builtin_tool_specs(vec![
+            ToolSpec::new("read", "core reader", json!({"type": "object"})),
+            ToolSpec::new(
+                "__lazy_specialist_test__",
+                "special test capability",
+                json!({"type": "object", "properties": {"large": {"type": "string"}}}),
+            ),
+        ]);
+        assert!(visible.iter().any(|spec| spec.name == "read"));
+        assert!(
+            visible
+                .iter()
+                .any(|spec| spec.name == FIND_BUILTIN_TOOLS_NAME)
+        );
+        assert!(
+            visible
+                .iter()
+                .all(|spec| spec.name != "__lazy_specialist_test__")
+        );
+    }
+
+    #[test]
+    fn lazy_builtin_payload_is_smaller_than_full_payload() {
+        fn payload_chars(specs: &[ToolSpec]) -> usize {
+            specs
+                .iter()
+                .map(|spec| {
+                    spec.name.len()
+                        + spec.description.len()
+                        + spec.parameters.to_string().len()
+                        + spec.prompt_snippet.as_deref().unwrap_or("").len()
+                        + spec
+                            .prompt_guidelines
+                            .iter()
+                            .map(String::len)
+                            .sum::<usize>()
+                })
+                .sum()
+        }
+        let dir =
+            std::env::temp_dir().join(format!("bbarit-oss-builtin-payload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = AppConfig::for_test(dir.clone());
+        let full = available_builtin_tool_specs(&config);
+        let full_chars = payload_chars(&full);
+        let lazy_chars = payload_chars(&lazy_builtin_tool_specs(full));
+        println!("built-in tool payload chars: full={full_chars}, lazy={lazy_chars}");
+        assert!(
+            lazy_chars * 4 <= full_chars * 3,
+            "expected at least 25% reduction: full={full_chars}, lazy={lazy_chars}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tool_search_activates_matching_builtin_schema() {
+        let dir =
+            std::env::temp_dir().join(format!("bbarit-oss-builtin-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::for_test(dir.clone());
+        config.tool_allowlist = vec!["github_search".to_string()];
+        let before = configured_tool_specs(&config, true);
+        assert!(
+            before
+                .iter()
+                .any(|spec| spec.name == FIND_BUILTIN_TOOLS_NAME)
+        );
+        assert!(before.iter().all(|spec| spec.name != "github_search"));
+
+        let result = find_builtin_tools(&config, "search github repository").unwrap();
+        assert!(result.contains("github_search"));
+        let after = configured_tool_specs(&config, true);
+        assert!(after.iter().any(|spec| spec.name == "github_search"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deferred_tool_matching_handles_ranking_misses_and_eight_tool_cap() {
+        let specs = (0..12)
+            .map(|index| {
+                ToolSpec::new(
+                    &format!("special_{index}"),
+                    if index == 7 {
+                        "unique browser automation"
+                    } else {
+                        "general specialist capability"
+                    },
+                    json!({"type": "object", "properties": {"index": {"const": index}}}),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let broad = matching_deferred_builtin_tools(specs.clone(), "special");
+        assert_eq!(broad.len(), 8);
+        assert!(broad.iter().all(|spec| spec.name.starts_with("special_")));
+
+        let exact = matching_deferred_builtin_tools(specs.clone(), "browser automation");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].name, "special_7");
+
+        let missed = matching_deferred_builtin_tools(specs, "definitely_absent_keyword");
+        assert!(missed.is_empty());
+    }
+
+    #[test]
+    fn disabling_builtin_tools_also_hides_tool_search() {
+        let dir = std::env::temp_dir().join(format!(
+            "bbarit-oss-builtin-disabled-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::for_test(dir.clone());
+        config.no_builtin_tools = true;
+        assert!(
+            configured_tool_specs(&config, true)
+                .iter()
+                .all(|spec| spec.name != FIND_BUILTIN_TOOLS_NAME)
+        );
+        config.no_tools = true;
+        assert!(configured_tool_specs(&config, true).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
     use serde_json::json;
 
     #[test]

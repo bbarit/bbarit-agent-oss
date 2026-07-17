@@ -16,7 +16,12 @@ use crate::tools;
 // keep a high safety backstop to prevent a pathological model from looping
 // forever, and on reaching it we return the latest output gracefully rather
 // than erroring out mid-task.
-const MAX_AGENT_TOOL_TURNS: usize = 1000;
+const MAX_AGENT_TOOL_TURNS: usize = 32;
+const MAX_TOOL_CALLS_PER_TURN: usize = 24;
+
+fn tool_call_budget_exhausted(tool_calls: usize) -> bool {
+    tool_calls > MAX_TOOL_CALLS_PER_TURN
+}
 
 // Compaction prompts.
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
@@ -1639,6 +1644,7 @@ fn is_read_only_tool(name: &str) -> bool {
             | "code_plan"
             | "todo"
             | "lsp"
+            | tools::FIND_BUILTIN_TOOLS_NAME
     )
 }
 
@@ -1706,6 +1712,13 @@ fn execute_trusted_tool_call(
         if !crate::computer::computer_action_is_readonly(action) {
             crate::trust::require_trusted(config, "control the computer")?;
         }
+    }
+    if name == tools::FIND_BUILTIN_TOOLS_NAME && !config.no_builtin_tools {
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        return Ok(ToolExecutionOutput {
+            text: tools::find_builtin_tools(config, query)?,
+            terminate: false,
+        });
     }
     if name == "generate_image" && !config.no_builtin_tools {
         return Ok(ToolExecutionOutput {
@@ -3090,14 +3103,14 @@ fn run_agent_loop(
         // hundreds of model calls. Stop BEFORE persisting the tool calls so no
         // dangling tool_use blocks corrupt the next request.
         turn_tool_calls += response.tool_calls.len();
-        if turn_tool_calls > 120 {
+        if tool_call_budget_exhausted(turn_tool_calls) {
             store.push_assistant_with_usage(
                 response.text.clone(),
                 Some(model_ref.clone()),
                 response.usage.clone(),
             )?;
             crate::llm::emit_activity(
-                "\n✗ stopped: tool-call budget for this turn exhausted (120)\n",
+                "\n✗ stopped: tool-call budget for this turn exhausted ({MAX_TOOL_CALLS_PER_TURN})\n",
             );
             return Ok(join_hook_notes(
                 hook_notes.join("\n"),
@@ -6616,7 +6629,7 @@ fn estimate_context_tokens(store: &SessionStore) -> usize {
 /// models) made EVERY request in a long tool loop carry a nearly full window —
 /// the dominant real-world token cost. Compact earlier at this budget instead.
 /// BBARIT_CONTEXT_BUDGET overrides (0 = window-limited only, old behavior).
-const DEFAULT_CONTEXT_BUDGET_TOKENS: usize = 120_000;
+const DEFAULT_CONTEXT_BUDGET_TOKENS: usize = 80_000;
 
 fn context_budget_tokens() -> usize {
     std::env::var("BBARIT_CONTEXT_BUDGET")
@@ -7489,7 +7502,58 @@ mod tests {
         assert!(should_compact(120_001, 200_000, reserve, 120_000));
         assert!(!should_compact(119_999, 200_000, reserve, 120_000));
         // …but never RAISES the window-derived ceiling.
-        assert!(should_compact(window - reserve + 1, window, reserve, 500_000));
+        assert!(should_compact(
+            window - reserve + 1,
+            window,
+            reserve,
+            500_000
+        ));
+    }
+
+    #[test]
+    fn token_safety_limits_have_exact_boundaries() {
+        assert_eq!(MAX_AGENT_TOOL_TURNS, 32);
+        assert_eq!((0..MAX_AGENT_TOOL_TURNS).count(), 32);
+
+        assert_eq!(MAX_TOOL_CALLS_PER_TURN, 24);
+        assert!(!tool_call_budget_exhausted(23));
+        assert!(!tool_call_budget_exhausted(24));
+        assert!(tool_call_budget_exhausted(25));
+
+        assert_eq!(DEFAULT_CONTEXT_BUDGET_TOKENS, 80_000);
+        let reserve = crate::config::DEFAULT_COMPACTION_RESERVE_TOKENS;
+        assert!(!should_compact(80_000, 1_000_000, reserve, 80_000));
+        assert!(should_compact(80_001, 1_000_000, reserve, 80_000));
+        // The smaller window ceiling still wins over the configured budget.
+        assert!(should_compact(70_001, 80_000, 10_000, 80_000));
+    }
+
+    #[test]
+    fn trusted_dispatch_executes_tool_search_end_to_end() {
+        let dir = std::env::temp_dir().join(format!(
+            "bbarit-oss-command-tool-search-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::for_test(dir.clone());
+        config.tool_allowlist = vec!["web_fetch".to_string()];
+
+        let output = execute_trusted_tool_call(
+            &config,
+            tools::FIND_BUILTIN_TOOLS_NAME,
+            "tool-search-test",
+            &json!({"query": "fetch web page"}),
+        )
+        .unwrap();
+        assert!(!output.terminate);
+        assert!(output.text.contains("web_fetch"));
+        assert!(
+            tools::configured_tool_specs(&config, true)
+                .iter()
+                .any(|spec| spec.name == "web_fetch")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
