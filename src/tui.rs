@@ -3541,6 +3541,12 @@ fn working_bar(tick: usize) -> String {
         .collect()
 }
 
+fn is_turn_cancel_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Esc
+        || matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// Run one turn on a worker thread, streaming deltas into a partial assistant
 /// entry while the UI keeps rendering and accepts input (Esc cancels, Enter
 /// queues a follow-up). Turn errors become a System entry, not a crash.
@@ -3653,11 +3659,12 @@ fn run_single_turn(
                             handle_transcript_mouse(app, mouse, render_partial);
                         }
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            if is_turn_cancel_key(key.code, key.modifiers) {
+                                crate::commands::request_cancel();
+                                cancelling = true;
+                                continue;
+                            }
                             match (key.code, key.modifiers) {
-                                (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-                                    crate::commands::request_cancel();
-                                    cancelling = true;
-                                }
                                 (KeyCode::PageUp, _) => app.scroll_up_by(10),
                                 (KeyCode::PageDown, _) => app.scroll_down_by(10),
                                 (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
@@ -5841,6 +5848,21 @@ mod tests {
         // Typing text must not dismiss the prompt; only Ctrl+C 'c' counts.
         assert!(!is_login_ack_key(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(!is_login_ack_key(KeyCode::Char('c'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn active_turn_cancel_accepts_esc_and_all_ctrl_c_modifier_variants() {
+        assert!(is_turn_cancel_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(is_turn_cancel_key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(is_turn_cancel_key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        ));
+        assert!(!is_turn_cancel_key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!is_turn_cancel_key(KeyCode::Enter, KeyModifiers::CONTROL));
     }
 
     #[test]

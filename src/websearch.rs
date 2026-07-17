@@ -5,7 +5,7 @@
 
 use std::env;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 
 fn client() -> Result<reqwest::blocking::Client> {
@@ -13,6 +13,44 @@ fn client() -> Result<reqwest::blocking::Client> {
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("bbarit-agent")
         .build()?)
+}
+
+/// Run a read-only blocking web operation on a helper thread while the caller
+/// polls the agent cancel flag. Dropping the receiver abandons the in-flight
+/// request safely; the helper owns no mutable project state.
+fn run_cancellable<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    run_cancellable_with(operation, crate::commands::cancel_requested)
+}
+
+fn run_cancellable_with<T, F, C>(operation: F, cancelled: C) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+    C: Fn() -> bool,
+{
+    if cancelled() {
+        bail!("web request cancelled");
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(operation());
+    });
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if cancelled() => {
+                bail!("web request cancelled");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("web request thread ended unexpectedly"));
+            }
+        }
+    }
 }
 
 fn github_token() -> Option<String> {
@@ -28,12 +66,15 @@ pub fn web_search(query: &str, limit: usize) -> Result<String> {
     if query.trim().is_empty() {
         bail!("web_search requires a query");
     }
-    let response = client()?
-        .post("https://html.duckduckgo.com/html/")
-        .form(&[("q", query)])
-        .send()?
-        .error_for_status()?;
-    let body = response.text()?;
+    let query_owned = query.to_string();
+    let body = run_cancellable(move || {
+        Ok(client()?
+            .post("https://html.duckduckgo.com/html/")
+            .form(&[("q", query_owned)])
+            .send()?
+            .error_for_status()?
+            .text()?)
+    })?;
 
     let link = Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)?;
     let snippet = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#)?;
@@ -85,19 +126,22 @@ pub fn github_search(query: &str, kind: &str, limit: usize) -> Result<String> {
     if !code {
         url.push_str("&sort=stars&order=desc");
     }
-    let mut request = client()?
-        .get(url)
-        .header("Accept", "application/vnd.github+json");
-    if let Some(token) = github_token() {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send()?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        bail!("GitHub search failed ({status}): {}", body.trim());
-    }
-    let json: serde_json::Value = response.json()?;
+    let token = github_token();
+    let json: serde_json::Value = run_cancellable(move || {
+        let mut request = client()?
+            .get(url)
+            .header("Accept", "application/vnd.github+json");
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send()?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            bail!("GitHub search failed ({status}): {}", body.trim());
+        }
+        Ok(response.json()?)
+    })?;
     let items = json["items"].as_array().cloned().unwrap_or_default();
     if items.is_empty() {
         return Ok(format!("No GitHub {kind} results for {query}"));
@@ -128,13 +172,86 @@ pub fn web_fetch(url: &str, max_chars: usize) -> Result<String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         bail!("web_fetch requires an http(s) URL");
     }
-    let body = client()?.get(url).send()?.error_for_status()?.text()?;
+    let url = url.to_string();
+    let body =
+        run_cancellable(move || Ok(client()?.get(url).send()?.error_for_status()?.text()?))?;
     let text = clean_html(&body);
     if text.chars().count() > max_chars {
         let truncated: String = text.chars().take(max_chars).collect();
         Ok(format!("{truncated}\n\n[truncated]"))
     } else {
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn stalled_http_body_returns_promptly_when_cancelled() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let release_server = Arc::new(AtomicBool::new(false));
+        let release = Arc::clone(&release_server);
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request);
+            // Headers arrive, but the advertised body deliberately stalls.
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                .unwrap();
+            while !release.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = socket.write_all(b"late");
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            signal.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let result = run_cancellable_with(
+            move || Ok(client()?.get(format!("http://{address}")).send()?.text()?),
+            || cancelled.load(Ordering::Relaxed),
+        );
+        release_server.store(true, Ordering::Relaxed);
+        trigger.join().unwrap();
+        server.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "cancel took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn completed_web_operation_returns_its_value() {
+        let value = run_cancellable_with(|| Ok::<_, anyhow::Error>("done"), || false).unwrap();
+        assert_eq!(value, "done");
+    }
+
+    #[test]
+    fn pre_cancelled_web_operation_does_not_start() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&ran);
+        let result = run_cancellable_with(
+            move || {
+                marker.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+            || true,
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(!ran.load(Ordering::Relaxed));
     }
 }
 
