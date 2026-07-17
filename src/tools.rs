@@ -894,35 +894,29 @@ pub fn read_file(path: &Path, offset: Option<usize>, limit: Option<usize>) -> Re
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
         let hint = match ext.as_str() {
-            "xlsx" | "xls" => {
-                "This is a spreadsheet — use the `xlsx` tool (actions: listSheets / getCells \
-                 / setCells / save). Do NOT try Python: openpyxl/pandas are not installed."
-            }
-            "pptx" | "ppt" => {
-                "This is a presentation — use the `pptx` tool (actions: listSlides / addSlide \
-                 with a designed layout (title/section/bullets/two-column/quote/metrics/timeline/\
-                 comparison/chart/closing) / addText / addShape / addImage / addTable / setNotes / \
-                 applyTheme / polishDesign / setTransition / duplicateSlide / deleteSlide / \
-                 moveSlide / updateElement / save). Build new decks with applyTheme + addSlide \
-                 layouts for a designed look. Do NOT try Python: python-pptx is not installed."
-            }
-            "docx" | "doc" => {
-                "This is a Word document — use the `docx` tool (actions: getText / append / \
-                 replace / setHtml / save). Do NOT try Python: python-docx is not installed."
+            // bbarit-oss has no office tools — never point the model at ones
+            // that don't exist here (the app-integrated agent has them).
+            "xlsx" | "xls" | "pptx" | "ppt" | "docx" | "doc" => {
+                "This is a binary Office document and bbarit-oss has no built-in office \
+                 editor. Ask the user for a text/CSV/markdown export, or convert it with a \
+                 locally installed CLI via bash if one exists. Do NOT try Python: \
+                 openpyxl/python-pptx/python-docx are not installed."
             }
             "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mp3" | "wav" | "m4a" | "ogg"
             | "flac" => {
-                "This is a media file — open it in the app's player/editor with the `editor` \
-                 tool (action: \"open\"), or read its metadata with bash: `ffprobe -v error \
-                 -show_format -show_streams <file>` (needs ffmpeg installed)."
+                "This is a media file — read its metadata with bash: `ffprobe -v error \
+                 -show_format -show_streams <file>` (needs ffmpeg installed), or ask the \
+                 user to open it in their player."
             }
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svgz" => {
-                "This is an image — open it in the app viewer with the `editor` tool \
-                 (action: \"open\")."
+                "This is an image file — attach it to the conversation (@path in the \
+                 input) to look at it, or inspect metadata with bash (`file`, `sips -g all` \
+                 on macOS)."
             }
             "pdf" => {
-                "This is a PDF — open it in the app viewer with the `editor` tool \
-                 (action: \"open\")."
+                "This is a PDF — extract text with a locally installed CLI via bash \
+                 (`pdftotext <file> -` if poppler is installed), or ask the user for a \
+                 text export."
             }
             _ => "Inspect it with bash (`file`, `xxd`, `strings`) if needed.",
         };
@@ -5636,18 +5630,19 @@ mod tests {
 
     #[test]
     fn read_binary_hints_point_to_builtin_tools() {
-        // A bare "use bash" hint sent models to python/openpyxl (not installed)
-        // for office files, and left media files looking simply unreadable.
+        // Hints must never recommend tools that don't exist in bbarit-oss
+        // (no office/editor tools here) nor Python libs that aren't installed.
         let dir = fixture_dir("read-binary-hints");
         fs::write(dir.join("book.xlsx"), b"PK\x03\x04\x00\x01\x02").unwrap();
         let output = execute_tool(&dir, "read", &json!({"path": "book.xlsx"})).unwrap();
-        assert!(output.contains("`xlsx` tool"), "{output}");
+        assert!(output.contains("no built-in office"), "{output}");
         assert!(output.contains("openpyxl"), "{output}");
+        assert!(!output.contains("`xlsx` tool"), "{output}");
 
         fs::write(dir.join("clip.mp4"), b"\x00\x00\x00\x18ftypmp42\x00\x01").unwrap();
         let output = execute_tool(&dir, "read", &json!({"path": "clip.mp4"})).unwrap();
-        assert!(output.contains("`editor`"), "{output}");
         assert!(output.contains("ffprobe"), "{output}");
+        assert!(!output.contains("`editor`"), "{output}");
     }
 
     #[test]
