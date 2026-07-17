@@ -173,10 +173,20 @@ impl std::io::Read for CancellableRead {
 /// Parse an Anthropic Messages SSE stream into a Completion, emitting text
 /// deltas to the stream sink as they arrive. Accumulates the same result the
 /// non-streaming JSON response would produce.
+#[cfg(test)]
 fn parse_anthropic_sse<R: std::io::BufRead>(
     reader: R,
     tools: &[ToolSpec],
     is_oauth: bool,
+) -> Result<AnthropicStreamOutcome> {
+    parse_anthropic_sse_with_tool_names(reader, tools, is_oauth, None)
+}
+
+fn parse_anthropic_sse_with_tool_names<R: std::io::BufRead>(
+    reader: R,
+    tools: &[ToolSpec],
+    is_oauth: bool,
+    kimi_tool_names: Option<&KimiToolNameMap>,
 ) -> Result<AnthropicStreamOutcome> {
     let mut text = String::new();
     // index -> (id, name, partial_json)
@@ -335,12 +345,14 @@ fn parse_anthropic_sse<R: std::io::BufRead>(
     );
     let mut tool_calls = Vec::new();
     for (_, (id, name, partial)) in tool_blocks {
-        let arguments = finalize_tool_arguments(&name, &partial);
         let name = if is_oauth {
             from_claude_code_name(&name, tools)
+        } else if let Some(names) = kimi_tool_names {
+            names.restore_original(&name)
         } else {
             name
         };
+        let arguments = finalize_tool_arguments(&name, &partial);
         tool_calls.push(ToolCall {
             id,
             name,
@@ -2706,10 +2718,17 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
     let is_oauth = api_key.contains("sk-ant-oat")
         && model.provider != "github-copilot"
         && request_config.auth_header.is_none();
+    let kimi_tool_names = (model.provider == "kimi-coding").then(|| KimiToolNameMap::new(tools));
+    let kimi_tools = kimi_tool_names
+        .as_ref()
+        .map(|names| names.wire_tools(tools));
+    let request_tools = kimi_tools.as_deref().unwrap_or(tools);
     let mut messages = anthropic_conversation(messages);
     remove_unsupported_anthropic_assistant_prefill(model, &mut messages);
     if is_oauth {
         remap_anthropic_tool_use_names(&mut messages);
+    } else if let Some(names) = &kimi_tool_names {
+        names.remap_tool_uses(&mut messages);
     }
     // Prompt caching: short/ephemeral by default (disabled only when
     // PI_CACHE_RETENTION=none). Matches the getCacheControl + the cache_control
@@ -2792,7 +2811,7 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
         "messages": messages,
     });
     apply_anthropic_thinking(&mut body, model, thinking, max_tokens);
-    let system = system_text(config, tools);
+    let system = system_text(config, request_tools);
     let mut system_blocks: Vec<Value> = Vec::new();
     if is_oauth {
         // OAuth requests MUST lead with the Claude Code identity block.
@@ -2807,8 +2826,8 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
     if !system_blocks.is_empty() {
         body["system"] = json!(system_blocks);
     }
-    if !tools.is_empty() {
-        let mut tool_defs = anthropic_tools(tools);
+    if !request_tools.is_empty() {
+        let mut tool_defs = anthropic_tools(request_tools);
         if is_oauth {
             for def in &mut tool_defs {
                 if let Some(name) = def.get("name").and_then(Value::as_str) {
@@ -2858,10 +2877,11 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
                 config,
                 send_body,
             )?;
-            match parse_anthropic_sse(
+            match parse_anthropic_sse_with_tool_names(
                 std::io::BufReader::new(CancellableRead::new(response)),
                 tools,
                 is_oauth,
+                kimi_tool_names.as_ref(),
             ) {
                 Err(error)
                     if can_retry && error.to_string().starts_with(RETRYABLE_STREAM_ERROR) =>
@@ -2962,10 +2982,17 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
         .filter(|text| !text.is_empty())
         .unwrap_or_default();
     let mut tool_calls = extract_anthropic_tool_calls(&response)?;
-    if is_oauth {
-        // Map Claude Code tool names in the response back to our tool names.
+    if is_oauth || kimi_tool_names.is_some() {
+        // Map provider-facing tool names in the response back to our tool names.
         for call in &mut tool_calls {
-            call.name = from_claude_code_name(&call.name, tools);
+            call.name = if is_oauth {
+                from_claude_code_name(&call.name, tools)
+            } else {
+                kimi_tool_names
+                    .as_ref()
+                    .map(|names| names.restore_original(&call.name))
+                    .unwrap_or_else(|| call.name.clone())
+            };
         }
     }
     if let Some(reason) = response["stop_reason"]
@@ -3034,6 +3061,150 @@ fn from_claude_code_name(name: &str, tools: &[ToolSpec]) -> String {
         .find(|tool| tool.name.eq_ignore_ascii_case(name))
         .map(|tool| tool.name.clone())
         .unwrap_or_else(|| name.to_string())
+}
+
+const KIMI_TOOL_NAME_MAX_LEN: usize = 64;
+
+#[derive(Debug, Default)]
+struct KimiToolNameMap {
+    original_to_wire: BTreeMap<String, String>,
+    wire_to_original: BTreeMap<String, String>,
+}
+
+impl KimiToolNameMap {
+    fn new(tools: &[ToolSpec]) -> Self {
+        // Build from unique originals in sorted order so aliases stay stable even
+        // when lazy tools or MCP servers change the order of the tool list.
+        let originals = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let bases = originals
+            .iter()
+            .map(|name| (name.clone(), kimi_safe_tool_name(name)))
+            .collect::<BTreeMap<_, _>>();
+        let mut base_counts = BTreeMap::<String, usize>::new();
+        for base in bases.values() {
+            *base_counts.entry(base.to_ascii_lowercase()).or_default() += 1;
+        }
+
+        let mut map = Self::default();
+        let mut used = std::collections::BTreeSet::<String>::new();
+        for (original, base) in bases {
+            let collides = base_counts
+                .get(&base.to_ascii_lowercase())
+                .copied()
+                .unwrap_or_default()
+                > 1;
+            let mut nonce = 0u32;
+            let wire = loop {
+                let candidate = if collides || nonce > 0 {
+                    let hash = stable_tool_name_hash(&original).wrapping_add(nonce);
+                    kimi_tool_name_with_suffix(&base, &format!("_{hash:08x}"))
+                } else {
+                    base.clone()
+                };
+                if used.insert(candidate.to_ascii_lowercase()) {
+                    break candidate;
+                }
+                nonce = nonce.wrapping_add(1);
+            };
+            map.wire_to_original.insert(wire.clone(), original.clone());
+            map.original_to_wire.insert(original, wire);
+        }
+        map
+    }
+
+    fn to_wire(&self, name: &str) -> String {
+        self.original_to_wire
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.original_to_wire
+                    .iter()
+                    .find(|(original, _)| original.eq_ignore_ascii_case(name))
+                    .map(|(_, wire)| wire.clone())
+            })
+            // Old sessions can reference a removed extension/MCP tool. It still
+            // has to be valid in history even though it is no longer advertised.
+            .unwrap_or_else(|| kimi_safe_tool_name(name))
+    }
+
+    fn restore_original(&self, name: &str) -> String {
+        self.wire_to_original
+            .get(name)
+            .cloned()
+            .or_else(|| {
+                self.wire_to_original
+                    .iter()
+                    .find(|(wire, _)| wire.eq_ignore_ascii_case(name))
+                    .map(|(_, original)| original.clone())
+            })
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    fn wire_tools(&self, tools: &[ToolSpec]) -> Vec<ToolSpec> {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                tool.name = self.to_wire(&tool.name);
+                tool
+            })
+            .collect()
+    }
+
+    fn remap_tool_uses(&self, messages: &mut [Value]) {
+        for message in messages.iter_mut() {
+            let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for block in content.iter_mut() {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && let Some(name) = block.get("name").and_then(Value::as_str)
+                {
+                    block["name"] = json!(self.to_wire(name));
+                }
+            }
+        }
+    }
+}
+
+fn kimi_safe_tool_name(name: &str) -> String {
+    let mut safe = String::new();
+    let mut previous_was_replacement = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            safe.push(ch);
+            previous_was_replacement = false;
+        } else if !previous_was_replacement {
+            safe.push('_');
+            previous_was_replacement = true;
+        }
+    }
+    if !safe.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+        let suffix = safe.trim_start_matches('_');
+        safe = if suffix.is_empty() {
+            "tool".to_string()
+        } else {
+            format!("tool_{suffix}")
+        };
+    }
+    safe.truncate(KIMI_TOOL_NAME_MAX_LEN);
+    safe
+}
+
+fn kimi_tool_name_with_suffix(base: &str, suffix: &str) -> String {
+    let keep = KIMI_TOOL_NAME_MAX_LEN.saturating_sub(suffix.len());
+    let mut value = base[..base.len().min(keep)].to_string();
+    value.push_str(suffix);
+    value
+}
+
+fn stable_tool_name_hash(name: &str) -> u32 {
+    name.as_bytes().iter().fold(0x811c9dc5u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x01000193)
+    })
 }
 
 fn remap_anthropic_tool_use_names(messages: &mut [Value]) {
@@ -5373,6 +5544,101 @@ fn finalize_tool_arguments(name: &str, partial: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+            prompt_snippet: None,
+            prompt_guidelines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn kimi_tool_names_are_valid_stable_and_reversible() {
+        let tools = vec![
+            test_tool("read"),
+            test_tool("mcp__server.name__tool/read"),
+            test_tool("123 bad"),
+            test_tool("a.b"),
+            test_tool("a/b"),
+            test_tool(&format!("x{}", ".very-long".repeat(10))),
+        ];
+        let names = KimiToolNameMap::new(&tools);
+        let reversed = tools.iter().cloned().rev().collect::<Vec<_>>();
+        let reordered_names = KimiToolNameMap::new(&reversed);
+
+        assert_eq!(names.to_wire("read"), "read");
+        assert_eq!(
+            names.to_wire("mcp__server.name__tool/read"),
+            "mcp__server_name__tool_read"
+        );
+        assert_eq!(names.to_wire("123 bad"), "tool_123_bad");
+        assert_ne!(names.to_wire("a.b"), names.to_wire("a/b"));
+        for tool in &tools {
+            let wire = names.to_wire(&tool.name);
+            assert_eq!(wire, reordered_names.to_wire(&tool.name));
+            assert!(wire.len() <= KIMI_TOOL_NAME_MAX_LEN);
+            assert!(wire.as_bytes()[0].is_ascii_alphabetic());
+            assert!(
+                wire.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            );
+            assert_eq!(names.restore_original(&wire), tool.name);
+        }
+        assert!(names.wire_tools(&tools).iter().all(|tool| {
+            tool.name.as_bytes()[0].is_ascii_alphabetic()
+                && tool.name.len() <= KIMI_TOOL_NAME_MAX_LEN
+                && tool
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        }));
+    }
+
+    #[test]
+    fn kimi_tool_names_sanitize_removed_tools_in_conversation_history() {
+        let names = KimiToolNameMap::new(&[test_tool("read")]);
+        let mut messages = vec![json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "old-call",
+                "name": ".removed/tool",
+                "input": {}
+            }]
+        })];
+
+        names.remap_tool_uses(&mut messages);
+
+        assert_eq!(messages[0]["content"][0]["name"], "tool_removed_tool");
+    }
+
+    #[test]
+    fn kimi_streaming_tool_names_are_restored_before_execution() {
+        let tools = vec![test_tool("mcp__server.name__tool/read")];
+        let names = KimiToolNameMap::new(&tools);
+        let wire = names.to_wire(&tools[0].name);
+        let sse = format!(
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"{wire}\"}}}}\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\
+             data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\
+             data: {{\"type\":\"message_stop\"}}\n"
+        );
+
+        let completion = parse_anthropic_sse_with_tool_names(
+            std::io::Cursor::new(sse),
+            &tools,
+            false,
+            Some(&names),
+        )
+        .expect("parse Kimi SSE")
+        .completion;
+
+        assert_eq!(completion.tool_calls[0].name, tools[0].name);
+        assert_eq!(completion.tool_calls[0].arguments, json!({}));
+    }
 
     #[test]
     fn openai_cached_tokens_are_not_counted_twice() {
