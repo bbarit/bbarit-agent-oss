@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.11]
+
+- Esc now interrupts a codex websocket request that is stuck connecting. The
+  dial (TCP connect + TLS/upgrade handshake) had no timeout and ignored
+  cancellation, so a stalled server pinned the turn — "cancelling…" for
+  minutes. The dial now runs on a helper thread polled against the cancel
+  flag, with a 15s connect / 30s handshake-read ceiling of its own.
+- The `/resume` session list shows how recently each session was used, e.g.
+  "5m ago" / "2h ago" / "3d ago", based on the session file's last write.
+
 ## [0.1.10]
 
 - Claude browser OAuth login (`/login anthropic`) is disabled. The flow is kept
