@@ -1238,7 +1238,11 @@ fn harness_model_selector(
 
 /// Compact "provider/model" → "model" label for preset rows.
 fn short_model(reference: &str) -> String {
-    reference.rsplit('/').next().unwrap_or(reference).to_string()
+    reference
+        .rsplit('/')
+        .next()
+        .unwrap_or(reference)
+        .to_string()
 }
 
 /// Pick a saved harness preset to delete (/roles delete <name>).
@@ -3188,17 +3192,35 @@ fn apply_command(
     }
     // Wizard: chained pickers set planner → developer → reviewer in one pass.
     if let Some(role) = command.strip_prefix("@wizard:") {
-        app.selector = Some(harness_model_selector(registry, config, Some(role), false, true));
+        app.selector = Some(harness_model_selector(
+            registry,
+            config,
+            Some(role),
+            false,
+            true,
+        ));
         return;
     }
     if let Some(role) = command.strip_prefix("@wizall:") {
-        app.selector = Some(harness_model_selector(registry, config, Some(role), true, true));
+        app.selector = Some(harness_model_selector(
+            registry,
+            config,
+            Some(role),
+            true,
+            true,
+        ));
         return;
     }
     if let Some(rest) = command.strip_prefix("@wizpick:")
         && let Some((role, model_ref)) = rest.split_once(':')
     {
-        run_command_quiet(app, store, registry, config, &format!("/roles {role} {model_ref}"));
+        run_command_quiet(
+            app,
+            store,
+            registry,
+            config,
+            &format!("/roles {role} {model_ref}"),
+        );
         app.status = status_line(store, registry, config);
         app.selector = Some(match role {
             "planner" => harness_model_selector(registry, config, Some("developer"), false, true),
@@ -4234,18 +4256,17 @@ fn render(frame: &mut Frame, app: &mut App, partial: Option<&str>) {
         }
         if too_wide(&segments) {
             let first = usize::from(segments.first().is_some_and(|s| s.contains("PLAN")));
-            if let Some(project) = segments.get_mut(first) {
-                if let Some(idx) = project.find(" (") {
-                    project.truncate(idx);
-                }
+            if let Some(project) = segments.get_mut(first)
+                && let Some(idx) = project.find(" (")
+            {
+                project.truncate(idx);
             }
         }
-        if too_wide(&segments) {
-            if let Some(model) = segments.last_mut() {
-                if let Some(idx) = model.rfind('/') {
-                    *model = model[idx + 1..].to_string();
-                }
-            }
+        if too_wide(&segments)
+            && let Some(model) = segments.last_mut()
+            && let Some(idx) = model.rfind('/')
+        {
+            *model = model[idx + 1..].to_string();
         }
         let last = segments.len().saturating_sub(1);
         let mut spans: Vec<Span> = Vec::new();
@@ -6282,10 +6303,12 @@ mod tests {
         assert!(has("/roles team"), "saved preset applies in one tap");
         assert!(has("@delpreset"), "delete submenu when presets exist");
         // The preset row shows its models at a glance.
-        assert!(selector
-            .items
-            .iter()
-            .any(|(label, _)| label.contains("team") && label.contains("glm-5.2")));
+        assert!(
+            selector
+                .items
+                .iter()
+                .any(|(label, _)| label.contains("team") && label.contains("glm-5.2"))
+        );
 
         let del = delete_preset_selector(&config);
         assert!(del.items.iter().any(|(_, c)| c == "/roles delete team"));

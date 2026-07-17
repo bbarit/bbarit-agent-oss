@@ -1690,10 +1690,7 @@ mod tests {
         let path = Path::new("/proj/CLAUDE.md");
         // Under the limit: untouched.
         let small = "short context".to_string();
-        assert_eq!(
-            truncate_context_for_prompt(small.clone(), path, 100),
-            small
-        );
+        assert_eq!(truncate_context_for_prompt(small.clone(), path, 100), small);
         // Over the limit: clamped, and the model is told where the rest lives.
         let big = "x".repeat(300);
         let out = truncate_context_for_prompt(big, path, 100);

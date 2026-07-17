@@ -1190,7 +1190,7 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
         fs::write(
             deep.join("SKILL.md"),
-            &format!(
+            format!(
                 "---\nname: deep-skill\ndescription: {}\n---\nBody",
                 "long ".repeat(120)
             ),

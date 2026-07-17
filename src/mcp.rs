@@ -912,10 +912,19 @@ enabled = false
 
         let stopped = reload_servers();
 
-        assert_eq!(stopped, 1);
-        assert!(servers().lock().unwrap().is_empty());
-        assert!(failed_servers().lock().unwrap().is_empty());
-        assert!(activated_tools().lock().unwrap().is_empty());
+        // Other unit tests exercise MCP discovery in parallel and may have
+        // populated the process-global server map too. The contract under
+        // test is that reload stops every server (including our stub), not
+        // that this test owns the only server in the process.
+        assert!(stopped >= 1);
+        assert!(!servers().lock().unwrap().contains_key("stub"));
+        assert!(!failed_servers().lock().unwrap().contains("broken"));
+        assert!(
+            !activated_tools()
+                .lock()
+                .unwrap()
+                .contains("mcp__stub__tool")
+        );
     }
 
     #[test]

@@ -5141,23 +5141,22 @@ fn roles_command(config: &AppConfig, registry: &Registry, rest: &str) -> Result<
         Some(other) => {
             // A saved preset name applies its role→model set in one go.
             let name = other.to_ascii_lowercase();
-            if parts.next().is_none() {
-                if let Some(roles) = read_harness_presets(config)
+            if parts.next().is_none()
+                && let Some(roles) = read_harness_presets(config)
                     .get(&name)
                     .and_then(Value::as_object)
-                {
-                    clear_harness_roles(&mut map);
-                    for role in HARNESS_ROLES {
-                        if let Some(reference) = roles.get(role).and_then(Value::as_str) {
-                            map.insert(role.to_string(), json!(reference));
-                        }
+            {
+                clear_harness_roles(&mut map);
+                for role in HARNESS_ROLES {
+                    if let Some(reference) = roles.get(role).and_then(Value::as_str) {
+                        map.insert(role.to_string(), json!(reference));
                     }
-                    write_harness_roles(&path, &map)?;
-                    return Ok(format!(
-                        "Harness preset '{name}' applied.\n\n{}",
-                        format_harness_roles(config, &map)
-                    ));
                 }
+                write_harness_roles(&path, &map)?;
+                return Ok(format!(
+                    "Harness preset '{name}' applied.\n\n{}",
+                    format_harness_roles(config, &map)
+                ));
             }
             bail!(
                 "unknown harness role or preset '{other}'\n\
@@ -5201,10 +5200,7 @@ fn apply_role_assignments(
     map: &mut serde_json::Map<String, Value>,
     spec: &str,
 ) -> Result<()> {
-    for pair in spec
-        .split([' ', '\t', ','])
-        .filter(|part| !part.is_empty())
-    {
+    for pair in spec.split([' ', '\t', ',']).filter(|part| !part.is_empty()) {
         let Some((role, reference)) = pair.split_once('=') else {
             bail!("expected role=model, got '{pair}'");
         };
@@ -5216,7 +5212,10 @@ fn apply_role_assignments(
         if matches!(reference, "" | "clear" | "off" | "none") {
             map.remove(&role);
         } else {
-            if registry.resolve_reference_with_thinking(reference).is_none() {
+            if registry
+                .resolve_reference_with_thinking(reference)
+                .is_none()
+            {
                 bail!("model not found: {reference} (try a 'provider/model' from /model)");
             }
             map.insert(role, json!(reference));
@@ -5250,12 +5249,7 @@ pub fn harness_presets_overview(config: &AppConfig) -> Vec<(String, Vec<String>)
         .map(|(name, roles)| {
             let references = HARNESS_ROLES
                 .iter()
-                .filter_map(|role| {
-                    roles
-                        .get(*role)
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
+                .filter_map(|role| roles.get(*role).and_then(Value::as_str).map(str::to_string))
                 .collect();
             (name.clone(), references)
         })
@@ -5275,7 +5269,10 @@ fn save_harness_preset(
     }
     let roles: serde_json::Map<String, Value> = HARNESS_ROLES
         .iter()
-        .filter_map(|role| map.get(*role).map(|value| (role.to_string(), value.clone())))
+        .filter_map(|role| {
+            map.get(*role)
+                .map(|value| (role.to_string(), value.clone()))
+        })
         .collect();
     if roles.is_empty() {
         bail!("no role models set — assign some first, e.g. /roles planner=<provider/model>");
@@ -5495,7 +5492,10 @@ fn parse_harness_overrides(
                 if !HARNESS_ROLES.contains(&role.as_str()) {
                     bail!("unknown harness role '{role}' in @{spec} (planner/developer/reviewer)");
                 }
-                if registry.resolve_reference_with_thinking(reference).is_none() {
+                if registry
+                    .resolve_reference_with_thinking(reference)
+                    .is_none()
+                {
                     bail!("model not found: {reference} (try a 'provider/model' from /model)");
                 }
                 explicit.insert(role.clone());
@@ -7394,12 +7394,16 @@ mod tests {
         );
 
         // List shows it; delete removes it; applying afterwards errors.
-        assert!(roles_command(&config, &registry, "presets")
-            .unwrap()
-            .contains("fastteam"));
-        assert!(roles_command(&config, &registry, "delete fastteam")
-            .unwrap()
-            .contains("deleted"));
+        assert!(
+            roles_command(&config, &registry, "presets")
+                .unwrap()
+                .contains("fastteam")
+        );
+        assert!(
+            roles_command(&config, &registry, "delete fastteam")
+                .unwrap()
+                .contains("deleted")
+        );
         assert!(roles_command(&config, &registry, "fastteam").is_err());
 
         // Reserved words can never become preset names.
@@ -7439,7 +7443,7 @@ mod tests {
             overrides.get("reviewer").map(String::as_str),
             Some("zai/glm-5.2-fast")
         );
-        assert!(overrides.get("developer").is_none());
+        assert!(!overrides.contains_key("developer"));
 
         // A saved preset applies by name without touching harness-models.json.
         roles_command(&config, &registry, "planner=zai/glm-5.2").unwrap();

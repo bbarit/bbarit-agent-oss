@@ -184,6 +184,46 @@ pub fn web_fetch(url: &str, max_chars: usize) -> Result<String> {
     }
 }
 
+/// DuckDuckGo wraps result links as //duckduckgo.com/l/?uddg=<encoded-url>.
+fn decode_ddg_url(href: &str) -> String {
+    let candidate = href
+        .strip_prefix("//")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| href.to_string());
+    if let Some(index) = candidate.find("uddg=") {
+        let rest = &candidate[index + 5..];
+        let encoded = rest.split('&').next().unwrap_or(rest);
+        if let Ok(decoded) = urlencoding::decode(encoded) {
+            return decoded.into_owned();
+        }
+    }
+    if href.starts_with("//") {
+        format!("https:{href}")
+    } else {
+        href.to_string()
+    }
+}
+
+/// Strip script/style blocks and HTML tags, decode a few entities, and collapse
+/// whitespace to produce readable text.
+fn clean_html(input: &str) -> String {
+    let without_blocks = Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>")
+        .map(|re| re.replace_all(input, " ").into_owned())
+        .unwrap_or_else(|_| input.to_string());
+    let without_tags = Regex::new(r"(?s)<[^>]+>")
+        .map(|re| re.replace_all(&without_blocks, " ").into_owned())
+        .unwrap_or(without_blocks);
+    let decoded = without_tags
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,44 +293,4 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("cancelled"));
         assert!(!ran.load(Ordering::Relaxed));
     }
-}
-
-/// DuckDuckGo wraps result links as //duckduckgo.com/l/?uddg=<encoded-url>.
-fn decode_ddg_url(href: &str) -> String {
-    let candidate = href
-        .strip_prefix("//")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| href.to_string());
-    if let Some(index) = candidate.find("uddg=") {
-        let rest = &candidate[index + 5..];
-        let encoded = rest.split('&').next().unwrap_or(rest);
-        if let Ok(decoded) = urlencoding::decode(encoded) {
-            return decoded.into_owned();
-        }
-    }
-    if href.starts_with("//") {
-        format!("https:{href}")
-    } else {
-        href.to_string()
-    }
-}
-
-/// Strip script/style blocks and HTML tags, decode a few entities, and collapse
-/// whitespace to produce readable text.
-fn clean_html(input: &str) -> String {
-    let without_blocks = Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>")
-        .map(|re| re.replace_all(input, " ").into_owned())
-        .unwrap_or_else(|_| input.to_string());
-    let without_tags = Regex::new(r"(?s)<[^>]+>")
-        .map(|re| re.replace_all(&without_blocks, " ").into_owned())
-        .unwrap_or(without_blocks);
-    let decoded = without_tags
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ");
-    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
