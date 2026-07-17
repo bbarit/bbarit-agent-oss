@@ -53,8 +53,9 @@
 > **Why Rust.** One self-contained static binary — no Node, no Python, no runtime
 > to install. Startup is instant, memory stays low, and parallel sub-agents plus
 > live streaming are fast and memory-safe. It cross-compiles to macOS, Linux, and
-> Windows as a single file — `curl … | sh` on macOS/Linux, a direct `.exe`
-> download on Windows — and `--upgrade` self-updates in place on every platform.
+> Windows as a single file — one-line installers on every platform (`curl … | sh`
+> on macOS/Linux, `irm … | iex` on Windows) — and `--upgrade` self-updates in
+> place everywhere.
 >
 > **Why a built-in wiki.** Left to itself, an agent forgets your codebase between
 > sessions and burns time and tokens re-deriving how it works. The project wiki
@@ -95,8 +96,8 @@
 > **한국어 — 왜 Rust로 개발했나.** 런타임 없이 도는 단일 정적 바이너리 —
 > Node·Python·node_modules 불필요. 시작이 즉각적이고 메모리가 낮으며, 병렬
 > 서브에이전트와 실시간 스트리밍이 빠르고 메모리 안전합니다. macOS·Linux·Windows로
-> 크로스컴파일되는 단일 파일 — macOS·Linux는 `curl … | sh`, Windows는 릴리즈에서
-> `.exe` 직접 다운로드 — `--upgrade`는 모든 플랫폼에서 제자리 자기업데이트됩니다.
+> 크로스컴파일되는 단일 파일 — 모든 플랫폼 원라인 설치(macOS·Linux는 `curl … | sh`,
+> Windows는 `irm … | iex`) — `--upgrade`는 모든 플랫폼에서 제자리 자기업데이트됩니다.
 >
 > **한국어 — 왜 위키를 쓰나.** 그냥 두면 에이전트는 세션이 바뀔 때마다 코드베이스를
 > 잊고 구조를 다시 파악하느라 시간과 토큰을 낭비합니다. 프로젝트 위키는 코드에 대한
@@ -290,7 +291,7 @@ variable.
 
 | Provider | Auth |
 |---|---|
-| Anthropic (Claude) | OAuth (`claude.ai`) or `ANTHROPIC_API_KEY` |
+| Anthropic (Claude) | API key — `/login anthropic sk-ant-…` or `ANTHROPIC_API_KEY` (browser OAuth is disabled) |
 | OpenAI | `OPENAI_API_KEY` |
 | OpenAI Codex (ChatGPT) | OAuth / device login |
 | Google Gemini | `GEMINI_API_KEY` |
@@ -664,9 +665,11 @@ The agent is free and open source (MIT). You only pay your own LLM provider (or
 run a local model for $0).
 
 **How do I install it on Windows?**
-Download `bbarit-oss-windows-x64.exe` from the
-[releases page](https://github.com/bbarit/bbarit-agent-oss/releases); `--upgrade`
-self-updates it in place. macOS/Linux use `curl … | sh`.
+One line in PowerShell: `irm https://bbarit.com/agent/install.ps1 | iex` — it
+installs to `%LOCALAPPDATA%\Programs\bbarit-oss` and adds it to your PATH
+(Windows-on-ARM runs the x64 binary under emulation). `--upgrade` self-updates
+it in place. Binaries are also on the
+[releases page](https://github.com/bbarit/bbarit-agent-oss/releases).
 
 **Is my code private?**
 Yes — your keys and code stay on your machine and go only to the provider you
