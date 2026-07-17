@@ -228,51 +228,127 @@ pub fn skill_command_invocation(config: &AppConfig, name: &str, args: &str) -> R
     }
 }
 
+/// Prompt space is billed every turn, so the skills listing is compact: shared
+/// base dirs are named once (b0, b1, …) and each skill is one line with its
+/// path relative to a base and a whitespace-collapsed, length-clamped
+/// description. Full descriptions stay in the skill file itself.
+const SKILL_PROMPT_DESCRIPTION_LIMIT: usize = 280;
+
+fn clamp_skill_description(description: &str) -> String {
+    let collapsed = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= SKILL_PROMPT_DESCRIPTION_LIMIT {
+        return collapsed;
+    }
+    let mut out: String = collapsed
+        .chars()
+        .take(SKILL_PROMPT_DESCRIPTION_LIMIT)
+        .collect();
+    out.push('…');
+    out
+}
+
 pub fn format_skills_for_prompt(config: &AppConfig) -> Result<String> {
-    let visible = load_skills(config)?
+    let mut visible = load_skills(config)?
         .into_iter()
         .filter(|skill| !skill.disable_model_invocation)
         .collect::<Vec<_>>();
     if visible.is_empty() {
         return Ok(String::new());
     }
+    // Interop/home-scanned third-party skill dirs rank after the user's own
+    // and the project's — when the block budget truncates, those drop first.
+    let third_party: Vec<PathBuf> = dirs_next::home_dir()
+        .map(|home| {
+            vec![
+                home.join(".agents").join("skills"),
+                home.join(".claude").join("skills"),
+                home.join(".codex").join("skills"),
+            ]
+        })
+        .unwrap_or_default();
+    visible.sort_by_key(|skill| {
+        third_party
+            .iter()
+            .any(|dir| skill.file_path.starts_with(dir)) as usize
+    });
+    let mut bases: Vec<String> = Vec::new();
+    let mut rows: Vec<String> = Vec::new();
+    for skill in &visible {
+        let path = &skill.file_path;
+        let base_dir = if path
+            .file_stem()
+            .map(|stem| stem.eq_ignore_ascii_case("SKILL"))
+            .unwrap_or(false)
+        {
+            path.parent().and_then(|dir| dir.parent())
+        } else {
+            path.parent()
+        };
+        let location = match base_dir {
+            Some(base) => {
+                let base_str = base.display().to_string();
+                let id = bases
+                    .iter()
+                    .position(|known| *known == base_str)
+                    .unwrap_or_else(|| {
+                        bases.push(base_str);
+                        bases.len() - 1
+                    });
+                match path.strip_prefix(base) {
+                    Ok(rel) => format!("b{id}/{}", rel.display()),
+                    Err(_) => path.display().to_string(),
+                }
+            }
+            None => path.display().to_string(),
+        };
+        rows.push(format!(
+            "- {} ({location}): {}",
+            skill.name,
+            clamp_skill_description(&skill.description)
+        ));
+    }
     let mut lines = vec![
         String::from(
             "\n\nSkills below carry task-specific instructions you can pull in on demand.",
         ),
         String::from(
-            "When a task lines up with a skill's description, open that skill's file with the read tool.",
+            "When a task lines up with a skill's description, open that skill's file with the read tool before starting.",
         ),
         String::from(
-            "Relative paths inside a skill file are relative to that skill's own folder (the directory holding SKILL.md); expand them to an absolute path before passing them to any tool.",
+            "Skill file paths are relative to the numbered base dirs below. Relative paths inside a skill file are relative to that skill's own folder; expand them to an absolute path before passing them to any tool.",
+        ),
+        format!(
+            "Bases: {}",
+            bases
+                .iter()
+                .enumerate()
+                .map(|(id, base)| format!("b{id}={base}"))
+                .collect::<Vec<_>>()
+                .join("  ")
         ),
         String::new(),
         String::from("<available_skills>"),
     ];
-    for skill in visible {
-        lines.push(String::from("  <skill>"));
-        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!(
-            "    <description>{}</description>",
-            escape_xml(&skill.description)
-        ));
-        lines.push(format!(
-            "    <location>{}</location>",
-            escape_xml(&skill.file_path.display().to_string())
-        ));
-        lines.push(String::from("  </skill>"));
+    // Even one-line rows add up when many third-party skill dirs are scanned —
+    // budget the whole block and point at /skills for the tail.
+    const SKILLS_PROMPT_BUDGET: usize = 8_000;
+    let total = rows.len();
+    let mut used = 0usize;
+    let mut kept: Vec<String> = Vec::new();
+    for row in rows {
+        used += row.len() + 1;
+        if used > SKILLS_PROMPT_BUDGET && !kept.is_empty() {
+            kept.push(format!(
+                "- …and {} more skills — run /skills to list them all",
+                total - kept.len()
+            ));
+            break;
+        }
+        kept.push(row);
     }
+    lines.extend(kept);
     lines.push(String::from("</available_skills>"));
     Ok(lines.join("\n"))
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn resource_paths(config: &AppConfig, kind: &str) -> Vec<PathBuf> {
@@ -1110,15 +1186,40 @@ mod tests {
             "---\nname: xml-skill\ndescription: Use <xml> & quotes\n---\nBody",
         )
         .unwrap();
-        let config = fixture_config("skill-prompt-config", Vec::new(), vec![skills]);
+        let deep = skills.join("deep-skill");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(
+            deep.join("SKILL.md"),
+            &format!(
+                "---\nname: deep-skill\ndescription: {}\n---\nBody",
+                "long ".repeat(120)
+            ),
+        )
+        .unwrap();
+        let config = fixture_config("skill-prompt-config", Vec::new(), vec![skills.clone()]);
 
         let output = format_skills_for_prompt(&config).unwrap();
 
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("</available_skills>"));
-        assert!(output.contains("<location>"));
-        assert!(output.contains("Use &lt;xml&gt; &amp; quotes"));
-        assert!(!output.contains("<path>"));
+        // Compact one-line rows against a numbered base dir — the base path
+        // appears once (in the Bases line), not on every skill.
+        assert!(output.contains(&format!("={}", skills.display())));
+        let row = output
+            .lines()
+            .find(|line| line.starts_with("- xml-skill (b"))
+            .expect("xml-skill row");
+        assert!(row.contains("/xml.md): Use <xml> & quotes"));
+        let deep_row = output
+            .lines()
+            .find(|line| line.starts_with("- deep-skill (b"))
+            .expect("deep-skill row");
+        assert!(deep_row.contains("/deep-skill/SKILL.md):"));
+        assert_eq!(output.matches(&skills.display().to_string()).count(), 1);
+        // Long descriptions are clamped, not injected wholesale.
+        assert!(output.contains('…'));
+        assert!(!output.contains(&"long ".repeat(120)));
+        assert!(!output.contains("<location>"));
     }
 
     #[test]

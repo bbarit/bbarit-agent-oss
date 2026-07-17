@@ -64,12 +64,13 @@
 > stays consistent turn after turn. (Distinct from auto-memory: the wiki is
 > knowledge *about the code*; memory is facts *about you and the project*.)
 >
-> **Why it auto-loads Claude Code & Codex MCP servers and skills (closing a Pi
+> **Why it can reuse Claude Code & Codex MCP servers and skills (closing a Pi
 > gap).** Re-registering MCP servers and skills for every new agent is friction Pi
-> never removed. bbarit-oss reads your existing `~/.claude.json` /
-> `~/.claude/skills` and `~/.codex/config.toml` / `~/.codex/skills` and reuses
-> them **as-is — on by default** (`/interop`), so your tools work on day one with
-> zero reconfiguration.
+> never removed. Turn on `/interop` and bbarit-oss reads your existing
+> `~/.claude.json` / `~/.claude/skills` and `~/.codex/config.toml` /
+> `~/.codex/skills` and reuses them **as-is** — zero reconfiguration. It is
+> **off by default** so a fresh install stays lean: no foreign servers spawned,
+> no prompt tokens spent on other tools' skill libraries.
 >
 > **Why agent personas.** A generic assistant is mediocre at everything. **295
 > curated personas** turn the agent into a domain specialist — a backend
@@ -512,15 +513,15 @@ Where it looks (highest priority first — first match wins on a name clash):
 writes to another tool's config. Only stdio MCP servers are used; entries marked
 `disabled`/`enabled = false` are skipped, exactly as those tools would.
 
-**It is a toggle**, because not everyone wants it:
+**It is a toggle**, off by default:
 
 ```sh
 /interop            # show current state
-/interop off        # ignore Claude/Codex; use only bbarit-oss's own configs
-/interop on         # re-enable (the default)
+/interop on         # reuse Claude Code / Codex MCP servers and skills as-is
+/interop off        # back to only bbarit-oss's own configs (the default)
 ```
 
-Or set `BBARIT_INTEROP=0` in the environment or `~/.bbarit-oss/agent/.env`. The
+Or set `BBARIT_INTEROP=1` in the environment or `~/.bbarit-oss/agent/.env`. The
 setting is remembered, and `/settings` shows the live state.
 
 ## Skills, extensions, LSP & MCP

@@ -489,10 +489,14 @@ pub fn print_help() -> String {
         "  /cd [path]                    Change the codebase folder (TUI; picker if no path)",
         "  /goal [text|clear]            Set a goal for THIS session (auto-clears on next session)",
         "  /harness <task>               Plan → develop → review/test loop (role-separated)",
+        "  /harness @<spec> <task>       Same, one-shot models: @preset · @m1 @m2 @m3 · @role=model",
         "  /consensus [opts] <question>  Multi-model consensus: propose→challenge→revise→commit",
         "                                opts: --vote majority|weighted · --rounds N · --models a/b,c/d",
         "  /roles [glm|current|clear]    Easy harness model presets/menu",
         "  /roles <model>                Use one model for all harness roles",
+        "  /roles <m1> <m2> <m3>         Planner/developer/reviewer in order",
+        "  /roles planner=<m> developer=<m> reviewer=<m>   Set several roles in one line",
+        "  /roles save|presets|delete    Named role presets (/roles save fast → /harness @fast …)",
         "  /roles <role> <model|clear>   Advanced per-role harness models",
         "  /autoimprove [N]              Auto-run N self-improvement rounds (default 3)",
         "  /deps <action> [file]         Dependency intel: deps|dependents|impact|orphans|unused",
@@ -502,7 +506,7 @@ pub fn print_help() -> String {
         "  /mcp                          List MCP servers (.mcp.json) and their tools",
         "  /mcp add <name> <cmd> [args]  Register an MCP server in .mcp.json",
         "  /update                       Upgrade bbarit-oss to the latest release",
-        "  /interop [on|off]             Reuse Claude Code and Codex MCP servers/skills as-is",
+        "  /interop [on|off]             Reuse Claude Code and Codex MCP servers/skills (default off)",
         "  /hooks                        List lifecycle hooks (.bbarit/hooks.json)",
         "  /context [on|off]             Auto-retrieve relevant code (semble RAG) each turn",
         "  /files [path]                 Show the project file tree (codebase map)",
@@ -782,7 +786,7 @@ fn handle_command(
             };
             crate::config::set_agent_env_var(
                 "BBARIT_INTEROP",
-                if enabled { None } else { Some("0") },
+                if enabled { Some("1") } else { None },
             )?;
             crate::mcp::reload_servers();
             crate::resources::invalidate_skills_cache();
@@ -2859,6 +2863,7 @@ fn run_agent_loop(
                 context_tokens,
                 window as usize,
                 config.compaction_reserve_tokens,
+                context_budget_tokens(),
             ) {
                 match run_compaction(store, registry, config, "", "auto") {
                     Ok(note) => push_hook_note(&mut hook_notes, note),
@@ -5014,6 +5019,34 @@ fn roles_command(config: &AppConfig, registry: &Registry, rest: &str) -> Result<
         ));
     }
 
+    if matches!(lower.as_str(), "presets" | "list") {
+        return Ok(format_harness_presets(config));
+    }
+
+    // `/roles save <name>` / `/roles delete <name>` — named user presets.
+    let mut words = rest.split_whitespace();
+    let first = words.next().unwrap_or("").to_ascii_lowercase();
+    if matches!(first.as_str(), "save" | "delete" | "rm") {
+        let name = words.next().unwrap_or("").to_ascii_lowercase();
+        if name.is_empty() || words.next().is_some() {
+            bail!("usage: /roles {first} <name>");
+        }
+        if first == "save" {
+            return save_harness_preset(config, &map, &name);
+        }
+        return delete_harness_preset(config, &name);
+    }
+
+    // `/roles planner=<m> developer=<m> …` — several roles in one line.
+    if rest.split_whitespace().all(|token| token.contains('=')) {
+        apply_role_assignments(registry, &mut map, rest)?;
+        write_harness_roles(&path, &map)?;
+        return Ok(format!(
+            "Harness roles updated.\n\n{}",
+            format_harness_roles(config, &map)
+        ));
+    }
+
     if !rest.contains(char::is_whitespace)
         && registry.resolve_reference_with_thinking(rest).is_some()
     {
@@ -5021,6 +5054,23 @@ fn roles_command(config: &AppConfig, registry: &Registry, rest: &str) -> Result<
         write_harness_roles(&path, &map)?;
         return Ok(format!(
             "Harness planner/developer/reviewer all use {rest}.\n\n{}",
+            format_harness_roles(config, &map)
+        ));
+    }
+
+    // `/roles <m1> <m2> <m3>` — planner/developer/reviewer in order.
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    if (2..=3).contains(&tokens.len())
+        && tokens
+            .iter()
+            .all(|token| registry.resolve_reference_with_thinking(token).is_some())
+    {
+        for (role, reference) in HARNESS_ROLES.iter().zip(&tokens) {
+            map.insert(role.to_string(), json!(reference));
+        }
+        write_harness_roles(&path, &map)?;
+        return Ok(format!(
+            "Harness roles assigned in order (planner developer reviewer).\n\n{}",
             format_harness_roles(config, &map)
         ));
     }
@@ -5074,12 +5124,36 @@ fn roles_command(config: &AppConfig, registry: &Registry, rest: &str) -> Result<
                     .unwrap_or("(current model)")
             ))
         }
-        Some(other) => bail!(
-            "unknown harness role or preset '{other}'\n\
-             Easy: /roles glm | /roles current | /roles clear | /roles <provider/model>\n\
-             Advanced: /roles <planner|developer|reviewer> <provider/model|clear>\n\
-             Persona:  /roles <planner|developer|reviewer> persona <id|clear>"
-        ),
+        Some(other) => {
+            // A saved preset name applies its role→model set in one go.
+            let name = other.to_ascii_lowercase();
+            if parts.next().is_none() {
+                if let Some(roles) = read_harness_presets(config)
+                    .get(&name)
+                    .and_then(Value::as_object)
+                {
+                    clear_harness_roles(&mut map);
+                    for role in HARNESS_ROLES {
+                        if let Some(reference) = roles.get(role).and_then(Value::as_str) {
+                            map.insert(role.to_string(), json!(reference));
+                        }
+                    }
+                    write_harness_roles(&path, &map)?;
+                    return Ok(format!(
+                        "Harness preset '{name}' applied.\n\n{}",
+                        format_harness_roles(config, &map)
+                    ));
+                }
+            }
+            bail!(
+                "unknown harness role or preset '{other}'\n\
+                 Easy: /roles glm | /roles current | /roles clear | /roles <provider/model>\n\
+                 One line: /roles planner=<m> developer=<m> reviewer=<m>\n\
+                 Presets:  /roles save <name> | /roles <name> | /roles presets | /roles delete <name>\n\
+                 Advanced: /roles <planner|developer|reviewer> <provider/model|clear>\n\
+                 Persona:  /roles <planner|developer|reviewer> persona <id|clear>"
+            )
+        }
         None => Ok(format_harness_roles(config, &map)),
     }
 }
@@ -5101,8 +5175,135 @@ fn format_harness_roles(config: &AppConfig, map: &serde_json::Map<String, Value>
         out.push_str(&format!("  {role}: {value} · {persona}\n"));
     }
     out.push_str(
-        "\nEasy setup:\n  /roles glm\n  /roles current\n  /roles clear\n  /roles <provider/model>\n  /roles <role> persona <id|clear>",
+        "\nEasy setup:\n  /roles glm\n  /roles current\n  /roles clear\n  /roles <provider/model>\n  /roles <m1> <m2> <m3>   (planner developer reviewer in order)\n  /roles planner=<m> developer=<m> reviewer=<m>\n  /roles save <name> · /roles <name> · /roles presets\n  /roles <role> persona <id|clear>\n  One run only: /harness @<preset|model|role=model> <task>",
     );
+    out
+}
+
+/// `/roles planner=<m> developer=<m> …` — whitespace/comma separated
+/// `role=model` pairs applied in one line (`=clear` unsets a role).
+fn apply_role_assignments(
+    registry: &Registry,
+    map: &mut serde_json::Map<String, Value>,
+    spec: &str,
+) -> Result<()> {
+    for pair in spec
+        .split([' ', '\t', ','])
+        .filter(|part| !part.is_empty())
+    {
+        let Some((role, reference)) = pair.split_once('=') else {
+            bail!("expected role=model, got '{pair}'");
+        };
+        let role = role.trim().to_ascii_lowercase();
+        let reference = reference.trim();
+        if !HARNESS_ROLES.contains(&role.as_str()) {
+            bail!("unknown harness role '{role}' (planner/developer/reviewer)");
+        }
+        if matches!(reference, "" | "clear" | "off" | "none") {
+            map.remove(&role);
+        } else {
+            if registry.resolve_reference_with_thinking(reference).is_none() {
+                bail!("model not found: {reference} (try a 'provider/model' from /model)");
+            }
+            map.insert(role, json!(reference));
+        }
+    }
+    Ok(())
+}
+
+/// Words /roles treats as commands — a user preset can never shadow them.
+const HARNESS_PRESET_RESERVED: [&str; 13] = [
+    "show", "clear", "reset", "current", "default", "glm", "zai", "save", "delete", "rm",
+    "presets", "list", "persona",
+];
+
+fn harness_presets_path(config: &AppConfig) -> std::path::PathBuf {
+    config.user_app_dir.join("harness-presets.json")
+}
+
+fn read_harness_presets(config: &AppConfig) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(harness_presets_path(config))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Saved presets with their role model references (HARNESS_ROLES order), for
+/// the TUI roles menu.
+pub fn harness_presets_overview(config: &AppConfig) -> Vec<(String, Vec<String>)> {
+    read_harness_presets(config)
+        .iter()
+        .map(|(name, roles)| {
+            let references = HARNESS_ROLES
+                .iter()
+                .filter_map(|role| {
+                    roles
+                        .get(*role)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            (name.clone(), references)
+        })
+        .collect()
+}
+
+fn save_harness_preset(
+    config: &AppConfig,
+    map: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<String> {
+    if HARNESS_ROLES.contains(&name) || HARNESS_PRESET_RESERVED.contains(&name) {
+        bail!("'{name}' is reserved — pick another preset name");
+    }
+    if name.contains(['=', '/', ',', '@']) {
+        bail!("preset names cannot contain = / , @");
+    }
+    let roles: serde_json::Map<String, Value> = HARNESS_ROLES
+        .iter()
+        .filter_map(|role| map.get(*role).map(|value| (role.to_string(), value.clone())))
+        .collect();
+    if roles.is_empty() {
+        bail!("no role models set — assign some first, e.g. /roles planner=<provider/model>");
+    }
+    let mut presets = read_harness_presets(config);
+    presets.insert(name.to_string(), Value::Object(roles));
+    write_harness_roles(&harness_presets_path(config), &presets)?;
+    Ok(format!(
+        "Preset '{name}' saved.\n\n{}",
+        format_harness_presets(config)
+    ))
+}
+
+fn delete_harness_preset(config: &AppConfig, name: &str) -> Result<String> {
+    let mut presets = read_harness_presets(config);
+    if presets.remove(name).is_none() {
+        bail!("no preset named '{name}' (see /roles presets)");
+    }
+    write_harness_roles(&harness_presets_path(config), &presets)?;
+    Ok(format!("Preset '{name}' deleted."))
+}
+
+fn format_harness_presets(config: &AppConfig) -> String {
+    let presets = read_harness_presets(config);
+    if presets.is_empty() {
+        return "No saved presets yet. Set role models, then /roles save <name>.".to_string();
+    }
+    let mut out = String::from("Saved harness presets:\n");
+    for (name, roles) in &presets {
+        let detail = HARNESS_ROLES
+            .iter()
+            .filter_map(|role| {
+                roles
+                    .get(*role)
+                    .and_then(Value::as_str)
+                    .map(|reference| format!("{role}={reference}"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!("  {name}: {detail}\n"));
+    }
+    out.push_str("\nApply: /roles <name> · one run only: /harness @<name> <task>");
     out
 }
 
@@ -5187,10 +5388,14 @@ fn harness_command(
     config: &AppConfig,
     task: &str,
 ) -> Result<String> {
+    // Leading `@spec` tokens pick this run's role models without touching the
+    // saved /roles config: `@<preset>`, `@<provider/model>` (all roles), or
+    // `@planner=<m>[,reviewer=<m>]`.
+    let (overrides, task) = parse_harness_overrides(config, registry, task)?;
     let task = task.trim();
     if task.is_empty() {
         bail!(
-            "usage: /harness <task>   (multiple lines = one task per line, run sequentially as a queue)"
+            "usage: /harness [@preset|@model|@role=model] <task>   (multiple lines = one task per line, run sequentially as a queue)"
         );
     }
     if !config.project_trusted {
@@ -5207,7 +5412,13 @@ fn harness_command(
         .collect();
     let total = tasks.len();
     if total <= 1 {
-        return harness_run_one(store, registry, config, tasks.first().map_or(task, |t| t));
+        return harness_run_one(
+            store,
+            registry,
+            config,
+            tasks.first().map_or(task, |t| t),
+            &overrides,
+        );
     }
     let mut queue_log = Vec::new();
     for (index, one) in tasks.iter().enumerate() {
@@ -5222,7 +5433,7 @@ fn harness_command(
             "\n⚙ harness queue: task {}/{total} — {one}\n",
             index + 1
         ));
-        match harness_run_one(store, registry, config, one) {
+        match harness_run_one(store, registry, config, one, &overrides) {
             Ok(outcome) => {
                 queue_log.push(format!(
                     "=== TASK {}/{total}: {one} ===\n{outcome}",
@@ -5241,18 +5452,107 @@ fn harness_command(
     Ok(queue_log.join("\n\n"))
 }
 
+/// Split leading `@spec` tokens off a /harness task — one-shot role models for
+/// this run only (the saved /roles config is untouched). Each spec is a saved
+/// preset name, a `provider/model` for all roles, or comma-joined `role=model`
+/// pairs. Returns (role→model-reference overrides, remaining task text).
+fn parse_harness_overrides(
+    config: &AppConfig,
+    registry: &Registry,
+    task: &str,
+) -> Result<(std::collections::HashMap<String, String>, String)> {
+    let mut overrides = std::collections::HashMap::new();
+    let mut explicit: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut bare: Vec<String> = Vec::new();
+    let mut rest = task.trim_start();
+    loop {
+        let token = rest.split_whitespace().next().unwrap_or("");
+        let Some(spec) = token.strip_prefix('@') else {
+            break;
+        };
+        if spec.is_empty() {
+            break;
+        }
+        rest = rest[token.len()..].trim_start();
+        for part in spec.split(',').filter(|part| !part.is_empty()) {
+            if let Some((role, reference)) = part.split_once('=') {
+                let role = role.trim().to_ascii_lowercase();
+                let reference = reference.trim();
+                if !HARNESS_ROLES.contains(&role.as_str()) {
+                    bail!("unknown harness role '{role}' in @{spec} (planner/developer/reviewer)");
+                }
+                if registry.resolve_reference_with_thinking(reference).is_none() {
+                    bail!("model not found: {reference} (try a 'provider/model' from /model)");
+                }
+                explicit.insert(role.clone());
+                overrides.insert(role, reference.to_string());
+                continue;
+            }
+            let name = part.to_ascii_lowercase();
+            if let Some(roles) = read_harness_presets(config)
+                .get(&name)
+                .and_then(Value::as_object)
+            {
+                for role in HARNESS_ROLES {
+                    if let Some(reference) = roles.get(role).and_then(Value::as_str) {
+                        overrides.insert(role.to_string(), reference.to_string());
+                    }
+                }
+                continue;
+            }
+            if registry.resolve_reference_with_thinking(part).is_some() {
+                bare.push(part.to_string());
+                continue;
+            }
+            bail!(
+                "unknown @spec '{part}' — use @<preset>, @<provider/model>, or @role=model (see /roles presets)"
+            );
+        }
+    }
+    // Bare models assign positionally: one = all roles, two/three = planner
+    // developer reviewer in order. Explicit role= pairs always win.
+    if bare.len() > HARNESS_ROLES.len() {
+        bail!("at most 3 @<model> specs (planner developer reviewer order)");
+    }
+    if bare.len() == 1 {
+        for role in HARNESS_ROLES {
+            if !explicit.contains(role) {
+                overrides.insert(role.to_string(), bare[0].clone());
+            }
+        }
+    } else {
+        for (role, reference) in HARNESS_ROLES.iter().zip(&bare) {
+            if !explicit.contains(*role) {
+                overrides.insert(role.to_string(), reference.clone());
+            }
+        }
+    }
+    Ok((overrides, rest.to_string()))
+}
+
 /// One task through the role-separated pipeline (see harness_command).
 fn harness_run_one(
     store: &mut SessionStore,
     registry: &Registry,
     config: &AppConfig,
     task: &str,
+    overrides: &std::collections::HashMap<String, String>,
 ) -> Result<String> {
     let main = current_or_default_model(store, registry, config)?;
-    // Per-role models (set via /roles); each defaults to the current model.
-    let planner = harness_role_model(config, registry, "planner", &main);
-    let developer = harness_role_model(config, registry, "developer", &main);
-    let reviewer = harness_role_model(config, registry, "reviewer", &main);
+    // Per-role models: one-shot @overrides first, then /roles config, then the
+    // current model.
+    let role_model = |role: &str| -> SelectedModel {
+        overrides
+            .get(role)
+            .and_then(|reference| registry.resolve_reference_with_thinking(reference))
+            .map(|resolved| {
+                select_thinking(resolved.model, config.thinking_level.or(resolved.thinking))
+            })
+            .unwrap_or_else(|| harness_role_model(config, registry, role, &main))
+    };
+    let planner = role_model("planner");
+    let developer = role_model("developer");
+    let reviewer = role_model("reviewer");
     // Per-role personas (set via /roles <role> persona <id>): each stage can be
     // its own specialist — e.g. architect plans, QA engineer reviews.
     let planner_persona = stage_persona_prefix(config, "planner");
@@ -6205,10 +6505,13 @@ fn prune_old_tool_outputs(messages: &mut [Message]) {
             message.content
         );
     }
+    // `read` is deliberately NOT protected: file reads are the bulkiest
+    // long-session content and are always re-runnable — the newest ones are
+    // already covered by the recent-tokens budget below.
     let protected = |name: Option<&str>| {
         matches!(
             name,
-            Some("read" | "patch" | "todo" | "code_plan" | "checkpoint" | "rewind")
+            Some("patch" | "todo" | "code_plan" | "checkpoint" | "rewind")
         )
     };
     let mut recent_budget = KEEP_RECENT_TOOL_TOKENS;
@@ -6309,10 +6612,35 @@ fn estimate_context_tokens(store: &SessionStore) -> usize {
         .sum()
 }
 
-fn should_compact(context_tokens: usize, context_window: usize, reserve_tokens: usize) -> bool {
+/// Steady-state context cap. Riding at "window minus reserve" (~184k on 200k
+/// models) made EVERY request in a long tool loop carry a nearly full window —
+/// the dominant real-world token cost. Compact earlier at this budget instead.
+/// BBARIT_CONTEXT_BUDGET overrides (0 = window-limited only, old behavior).
+const DEFAULT_CONTEXT_BUDGET_TOKENS: usize = 120_000;
+
+fn context_budget_tokens() -> usize {
+    std::env::var("BBARIT_CONTEXT_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_CONTEXT_BUDGET_TOKENS)
+}
+
+fn should_compact(
+    context_tokens: usize,
+    context_window: usize,
+    reserve_tokens: usize,
+    budget_tokens: usize,
+) -> bool {
     // A model whose window is at or below the reserve can't meaningfully reserve
     // headroom; don't auto-compact it (also avoids compacting tiny test models).
-    context_window > reserve_tokens && context_tokens > context_window - reserve_tokens
+    if context_window <= reserve_tokens {
+        return false;
+    }
+    let mut ceiling = context_window - reserve_tokens;
+    if budget_tokens > 0 {
+        ceiling = ceiling.min(budget_tokens);
+    }
+    context_tokens > ceiling
 }
 
 fn extension_compaction_summary(results: &[Value]) -> Option<String> {
@@ -6975,16 +7303,193 @@ mod tests {
     }
 
     #[test]
+    fn roles_one_line_assignments_and_named_presets() {
+        let dir = std::env::temp_dir().join(format!("bbarit-roles-preset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = AppConfig::for_test(dir);
+        let registry = Registry::load(&config).unwrap();
+        let path = config.user_app_dir.join("harness-models.json");
+
+        // One-line multi-assign, any subset of roles.
+        let out = roles_command(
+            &config,
+            &registry,
+            "planner=zai/glm-5.2 developer=zai/glm-5.2-fast",
+        )
+        .unwrap();
+        assert!(out.contains("Harness roles updated"));
+        let saved: serde_json::Map<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("planner").and_then(Value::as_str),
+            Some("zai/glm-5.2")
+        );
+        assert_eq!(
+            saved.get("developer").and_then(Value::as_str),
+            Some("zai/glm-5.2-fast")
+        );
+        assert!(saved.get("reviewer").is_none());
+
+        // Positional `/roles <m1> <m2> <m3>` assigns planner/developer/reviewer
+        // in order.
+        let out = roles_command(
+            &config,
+            &registry,
+            "zai/glm-5.2-fast zai/glm-5.2 zai/glm-5.2-fast",
+        )
+        .unwrap();
+        assert!(out.contains("assigned in order"));
+        let saved: serde_json::Map<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("planner").and_then(Value::as_str),
+            Some("zai/glm-5.2-fast")
+        );
+        assert_eq!(
+            saved.get("developer").and_then(Value::as_str),
+            Some("zai/glm-5.2")
+        );
+        assert_eq!(
+            saved.get("reviewer").and_then(Value::as_str),
+            Some("zai/glm-5.2-fast")
+        );
+        roles_command(&config, &registry, "clear").unwrap();
+        roles_command(
+            &config,
+            &registry,
+            "planner=zai/glm-5.2 developer=zai/glm-5.2-fast",
+        )
+        .unwrap();
+
+        // Bad model and bad role both error.
+        assert!(roles_command(&config, &registry, "planner=nope/nothing").is_err());
+        assert!(roles_command(&config, &registry, "poet=zai/glm-5.2").is_err());
+
+        // Save → clear → apply by name round-trips the assignment.
+        let out = roles_command(&config, &registry, "save fastteam").unwrap();
+        assert!(out.contains("Preset 'fastteam' saved"));
+        roles_command(&config, &registry, "clear").unwrap();
+        let out = roles_command(&config, &registry, "fastteam").unwrap();
+        assert!(out.contains("preset 'fastteam' applied"));
+        let saved: serde_json::Map<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.get("planner").and_then(Value::as_str),
+            Some("zai/glm-5.2")
+        );
+
+        // List shows it; delete removes it; applying afterwards errors.
+        assert!(roles_command(&config, &registry, "presets")
+            .unwrap()
+            .contains("fastteam"));
+        assert!(roles_command(&config, &registry, "delete fastteam")
+            .unwrap()
+            .contains("deleted"));
+        assert!(roles_command(&config, &registry, "fastteam").is_err());
+
+        // Reserved words can never become preset names.
+        assert!(roles_command(&config, &registry, "save glm").is_err());
+        assert!(roles_command(&config, &registry, "save planner").is_err());
+    }
+
+    #[test]
+    fn harness_at_spec_gives_one_shot_role_models() {
+        let dir = std::env::temp_dir().join(format!("bbarit-harness-at-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = AppConfig::for_test(dir);
+        let registry = Registry::load(&config).unwrap();
+
+        // Bare model → all three roles; task text preserved.
+        let (overrides, task) =
+            parse_harness_overrides(&config, &registry, "@zai/glm-5.2 fix the bug").unwrap();
+        assert_eq!(task, "fix the bug");
+        for role in HARNESS_ROLES {
+            assert_eq!(overrides.get(role).map(String::as_str), Some("zai/glm-5.2"));
+        }
+
+        // Comma-joined role=model pairs override only those roles.
+        let (overrides, task) = parse_harness_overrides(
+            &config,
+            &registry,
+            "@planner=zai/glm-5.2,reviewer=zai/glm-5.2-fast add tests",
+        )
+        .unwrap();
+        assert_eq!(task, "add tests");
+        assert_eq!(
+            overrides.get("planner").map(String::as_str),
+            Some("zai/glm-5.2")
+        );
+        assert_eq!(
+            overrides.get("reviewer").map(String::as_str),
+            Some("zai/glm-5.2-fast")
+        );
+        assert!(overrides.get("developer").is_none());
+
+        // A saved preset applies by name without touching harness-models.json.
+        roles_command(&config, &registry, "planner=zai/glm-5.2").unwrap();
+        roles_command(&config, &registry, "save team").unwrap();
+        roles_command(&config, &registry, "clear").unwrap();
+        let (overrides, task) =
+            parse_harness_overrides(&config, &registry, "@team ship it").unwrap();
+        assert_eq!(task, "ship it");
+        assert_eq!(
+            overrides.get("planner").map(String::as_str),
+            Some("zai/glm-5.2")
+        );
+        let saved: serde_json::Map<String, Value> = serde_json::from_str(
+            &std::fs::read_to_string(config.user_app_dir.join("harness-models.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.get("planner").is_none());
+
+        // Three bare @models assign planner/developer/reviewer in order.
+        let (overrides, task) = parse_harness_overrides(
+            &config,
+            &registry,
+            "@zai/glm-5.2-fast @zai/glm-5.2 @zai/glm-5.2-fast do it",
+        )
+        .unwrap();
+        assert_eq!(task, "do it");
+        assert_eq!(
+            overrides.get("planner").map(String::as_str),
+            Some("zai/glm-5.2-fast")
+        );
+        assert_eq!(
+            overrides.get("developer").map(String::as_str),
+            Some("zai/glm-5.2")
+        );
+        assert_eq!(
+            overrides.get("reviewer").map(String::as_str),
+            Some("zai/glm-5.2-fast")
+        );
+
+        // No @spec → task untouched, no overrides.
+        let (overrides, task) = parse_harness_overrides(&config, &registry, "plain task").unwrap();
+        assert!(overrides.is_empty());
+        assert_eq!(task, "plain task");
+
+        // Typos fail fast instead of silently running on the wrong model.
+        assert!(parse_harness_overrides(&config, &registry, "@nope task").is_err());
+    }
+
+    #[test]
     fn should_compact_respects_reserve() {
         let window = 100_000;
         let reserve = crate::config::DEFAULT_COMPACTION_RESERVE_TOKENS;
-        // Below window - reserve: no compaction.
-        assert!(!should_compact(window - reserve - 1, window, reserve));
+        // Below window - reserve: no compaction (budget 0 = window-limited only).
+        assert!(!should_compact(window - reserve - 1, window, reserve, 0));
         // Above the threshold: compact.
-        assert!(should_compact(window - reserve + 1, window, reserve));
+        assert!(should_compact(window - reserve + 1, window, reserve, 0));
         // A window at/below the reserve never auto-compacts (small test models).
-        assert!(!should_compact(10_000, reserve, reserve));
-        assert!(!should_compact(10_000, 12_345, reserve));
+        assert!(!should_compact(10_000, reserve, reserve, 0));
+        assert!(!should_compact(10_000, 12_345, reserve, 0));
+        // A context budget compacts long before the window fills…
+        assert!(should_compact(120_001, 200_000, reserve, 120_000));
+        assert!(!should_compact(119_999, 200_000, reserve, 120_000));
+        // …but never RAISES the window-derived ceiling.
+        assert!(should_compact(window - reserve + 1, window, reserve, 500_000));
     }
 
     #[test]
@@ -7155,12 +7660,14 @@ mod tests {
             is_error: false,
             usage: None,
         };
-        // 200k tokens of old bash output + 40k of recent output: the old ones
-        // get pruned, the recent window and protected tools survive.
+        // 200k tokens of old bash/read output + recent output: the old ones
+        // get pruned (read included — file reads are re-runnable and the
+        // bulkiest long-session content), protected state tools survive.
         let big = "x".repeat(200_000); // ≈50k tokens each
         let mut messages = vec![
             tool_msg("bash", big.clone()),
             tool_msg("read", big.clone()),
+            tool_msg("code_plan", big.clone()),
             tool_msg("bash", big.clone()),
             tool_msg("bash", "recent tail output".to_string()),
         ];
@@ -7169,9 +7676,16 @@ mod tests {
             messages[0].content.contains("pruned from context"),
             "old bash pruned"
         );
-        assert!(!messages[1].content.contains("pruned"), "read is protected");
         assert!(
-            !messages[3].content.contains("pruned"),
+            messages[1].content.contains("pruned from context"),
+            "old read pruned too"
+        );
+        assert!(
+            !messages[2].content.contains("pruned"),
+            "plan/state tools stay protected"
+        );
+        assert!(
+            !messages[4].content.contains("pruned"),
             "recent output kept"
         );
         // None/small case: tiny histories are untouched (savings threshold).

@@ -57,6 +57,26 @@ BBARIT_AGENT_MODE=1 bbarit-oss --orchestrate "task A" "task B" "task C"
 Runs each positional input as an independent sub-agent process in parallel and
 collects the results.
 
+## 4) Harness — plan → develop → review with per-role models
+
+`/harness` runs one task through a role-separated pipeline (planner →
+developer ⇄ reviewer). Each role can use its own model:
+
+```bash
+# Persist role models (planner developer reviewer, in order), save as a preset:
+bbarit-oss -p '/roles zai/glm-5.2 openai/gpt-5.2 anthropic/claude-opus-4-8'
+bbarit-oss -p '/roles save myteam'
+
+# Run with the preset — or override models for one run only (nothing saved):
+bbarit-oss --approve -p '/harness @myteam add input validation'
+bbarit-oss --approve -p '/harness @planner=zai/glm-5.2,reviewer=openai/gpt-5.2 fix the bug'
+bbarit-oss --approve -p '/harness @m1 @m2 @m3 <task>'   # positional: planner dev reviewer
+```
+
+Other forms: `/roles planner=<m> developer=<m> reviewer=<m>` ·
+`/roles <model>` (all roles) · `/roles presets` · `/roles delete <name>` ·
+`/roles <role> persona <id>`.
+
 ## Environment variables
 
 | Variable | Meaning |
@@ -66,9 +86,10 @@ collects the results.
 | `BBARIT_AUTO_CONTEXT=0` | Disable start-of-turn auto-RAG (code-context injection) — faster for non-code tasks |
 | `BBARIT_AUTO_MEMORY=0` | Disable auto-memory recall/extract |
 | `BBARIT_PERSONA=<id>` | Set the startup persona |
-| `BBARIT_INTEROP=0` | Disable reuse of Claude Code / Codex MCP servers & skills (default: on) |
+| `BBARIT_INTEROP=1` | Reuse Claude Code / Codex MCP servers & skills (default: off) |
 | `BBARIT_AUTO_UPGRADE=1` | Upgrade in place at startup when a newer release exists (default: off) |
 | `BBARIT_NO_UPDATE_CHECK=1` | Disable the background "update available" check at startup |
+| `BBARIT_CONTEXT_FILE_LIMIT=<bytes>` | Per-file cap for AGENTS/CLAUDE.md prompt injection (default 20000; 0 = unlimited) |
 
 ## Performance notes
 

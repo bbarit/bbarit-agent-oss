@@ -1383,6 +1383,34 @@ fn load_context_files(cwd: &Path, user_app_dir: &Path) -> Result<Vec<ContextFile
     Ok(files)
 }
 
+// Context files ride along on EVERY request, so an oversized AGENTS/CLAUDE.md
+// silently multiplies token spend. Inject at most this many bytes per file and
+// tell the model where the rest lives. BBARIT_CONTEXT_FILE_LIMIT overrides
+// (0 = unlimited).
+const CONTEXT_FILE_PROMPT_LIMIT: usize = 20_000;
+
+fn context_file_limit() -> usize {
+    env::var("BBARIT_CONTEXT_FILE_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(CONTEXT_FILE_PROMPT_LIMIT)
+}
+
+pub fn truncate_context_for_prompt(content: String, path: &Path, limit: usize) -> String {
+    if limit == 0 || content.len() <= limit {
+        return content;
+    }
+    let mut cut = limit;
+    while !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n\n[context file truncated at {limit} bytes — use the read tool on {} for the rest]",
+        &content[..cut],
+        path.display()
+    )
+}
+
 fn collect_context_file(
     dir: &Path,
     seen: &mut std::collections::BTreeSet<PathBuf>,
@@ -1400,6 +1428,7 @@ fn collect_context_file(
         if path.exists() && seen.insert(path.clone()) {
             let content = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
+            let content = truncate_context_for_prompt(content, &path, context_file_limit());
             out.push(ContextFile { path, content });
             break;
         }
@@ -1654,5 +1683,29 @@ mod tests {
                     .join("shared"),
             ]
         );
+    }
+
+    #[test]
+    fn context_files_truncate_at_limit_with_read_pointer() {
+        let path = Path::new("/proj/CLAUDE.md");
+        // Under the limit: untouched.
+        let small = "short context".to_string();
+        assert_eq!(
+            truncate_context_for_prompt(small.clone(), path, 100),
+            small
+        );
+        // Over the limit: clamped, and the model is told where the rest lives.
+        let big = "x".repeat(300);
+        let out = truncate_context_for_prompt(big, path, 100);
+        assert!(out.starts_with(&"x".repeat(100)));
+        assert!(out.contains("truncated at 100 bytes"));
+        assert!(out.contains("/proj/CLAUDE.md"));
+        // Multibyte boundary: never splits a char.
+        let korean = "한글컨텍스트".repeat(50).to_string();
+        let out = truncate_context_for_prompt(korean, path, 100);
+        assert!(out.contains("truncated"));
+        // Limit 0 = unlimited.
+        let big = "y".repeat(300);
+        assert_eq!(truncate_context_for_prompt(big.clone(), path, 0), big);
     }
 }

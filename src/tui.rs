@@ -1144,6 +1144,7 @@ fn harness_model_selector(
     config: &AppConfig,
     role: Option<&str>,
     show_all: bool,
+    wizard: bool,
 ) -> Selector {
     let all_models = registry.search_models("");
     // Default to a SHORT list: only models from logged-in providers (the ones
@@ -1170,6 +1171,13 @@ fn harness_model_selector(
         }
     };
     let role_key = role.unwrap_or("all");
+    // In wizard mode a pick chains to the NEXT role's picker (@wizpick), so
+    // all three roles get set in one pass.
+    let wizard_next = match role_key {
+        "planner" => "@wizard:developer",
+        "developer" => "@wizard:reviewer",
+        _ => "@back:roles",
+    };
     let mut leading = vec![
         (
             "Back to harness roles".to_string(),
@@ -1177,15 +1185,34 @@ fn harness_model_selector(
         ),
         ("Back to menu".to_string(), "@menu".to_string()),
     ];
+    if wizard {
+        leading.push((
+            format!("Keep current {role_key} model (skip)"),
+            wizard_next.to_string(),
+        ));
+    }
     if !show_all {
         leading.push((
             "Show all models…".to_string(),
-            format!("@roleall:{role_key}"),
+            if wizard {
+                format!("@wizall:{role_key}")
+            } else {
+                format!("@roleall:{role_key}")
+            },
         ));
     }
-    let title = match role {
-        Some(role) => format!("Select {role} model"),
-        None => "Select one model for all harness roles".to_string(),
+    let title = if wizard {
+        let step = match role_key {
+            "planner" => "1/3",
+            "developer" => "2/3",
+            _ => "3/3",
+        };
+        format!("Step {step} — select {role_key} model")
+    } else {
+        match role {
+            Some(role) => format!("Select {role} model"),
+            None => "Select one model for all harness roles".to_string(),
+        }
     };
     let role_owned = role.map(str::to_string);
     model_picker_items(
@@ -1194,6 +1221,10 @@ fn harness_model_selector(
         models,
         &move |provider, id| {
             let model_ref = format!("{provider}/{id}");
+            if wizard {
+                let role = role_owned.as_deref().unwrap_or("planner");
+                return format!("@wizpick:{role}:{model_ref}");
+            }
             match &role_owned {
                 Some(role) => format!("/roles {role} {model_ref}"),
                 None => format!("/roles {model_ref}"),
@@ -1203,6 +1234,44 @@ fn harness_model_selector(
         title,
         String::new(),
     )
+}
+
+/// Compact "provider/model" → "model" label for preset rows.
+fn short_model(reference: &str) -> String {
+    reference.rsplit('/').next().unwrap_or(reference).to_string()
+}
+
+/// Pick a saved harness preset to delete (/roles delete <name>).
+fn delete_preset_selector(config: &AppConfig) -> Selector {
+    let mut items: Vec<(String, String)> = vec![
+        (
+            "Back to harness roles".to_string(),
+            "@back:roles".to_string(),
+        ),
+        ("Back to menu".to_string(), "@menu".to_string()),
+    ];
+    for (name, references) in crate::commands::harness_presets_overview(config) {
+        let detail = references
+            .iter()
+            .map(|reference| short_model(reference))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let label = if detail.is_empty() {
+            format!("Delete {name}")
+        } else {
+            format!("Delete {name} — {detail}")
+        };
+        items.push((label, format!("/roles delete {name}")));
+    }
+    let mut selector = Selector {
+        title: "Delete a harness preset".to_string(),
+        items,
+        filter: String::new(),
+        cursor: 0,
+        styled: Default::default(),
+    };
+    selector.cursor = selector.first_selectable();
+    selector
 }
 
 /// One-stop settings dashboard: every session/harness knob with its CURRENT
@@ -1415,11 +1484,43 @@ fn roles_selector(config: &AppConfig) -> Selector {
     };
     let mut items: Vec<(String, String)> = vec![
         ("Back to menu".to_string(), "@menu".to_string()),
+        ("Easy".to_string(), String::new()),
         (
-            "Models — pick a role to set its model".to_string(),
-            String::new(),
+            "Set all 3 in a row (planner → developer → reviewer)".to_string(),
+            "@wizard:planner".to_string(),
         ),
+        (
+            "Run harness with these roles…".to_string(),
+            "/harness ".to_string(),
+        ),
+        ("Presets — one tap to apply".to_string(), String::new()),
+        ("GLM (built-in)".to_string(), "/roles glm".to_string()),
     ];
+    let saved = crate::commands::harness_presets_overview(config);
+    for (name, references) in &saved {
+        let detail = references
+            .iter()
+            .map(|reference| short_model(reference))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let label = if detail.is_empty() {
+            name.clone()
+        } else {
+            format!("{name} — {detail}")
+        };
+        items.push((label, format!("/roles {name}")));
+    }
+    items.push((
+        "Save current as preset…".to_string(),
+        "/roles save ".to_string(),
+    ));
+    if !saved.is_empty() {
+        items.push(("Delete a preset…".to_string(), "@delpreset".to_string()));
+    }
+    items.push((
+        "Models — pick a role to set its model".to_string(),
+        String::new(),
+    ));
     for (role, reference) in &assignments {
         let nice = match role.as_str() {
             "planner" => "Planner",
@@ -1432,6 +1533,10 @@ fn roles_selector(config: &AppConfig) -> Selector {
             format!("@role:{role}"),
         ));
     }
+    items.push((
+        "Same model for all roles".to_string(),
+        "@role:all".to_string(),
+    ));
     items.push((
         "Personas — pick a role to set its persona".to_string(),
         String::new(),
@@ -1450,12 +1555,9 @@ fn roles_selector(config: &AppConfig) -> Selector {
     }
     items.extend(
         [
-            ("Quick", ""),
-            ("Same model for all roles", "@role:all"),
-            ("Use current chat model for all", "/roles current"),
             ("Reset", ""),
+            ("Use current chat model for all", "/roles current"),
             ("Clear custom role models", "/roles clear"),
-            ("Preset: GLM", "/roles glm"),
         ]
         .into_iter()
         .map(|(label, command)| (label.to_string(), command.to_string())),
@@ -1998,6 +2100,7 @@ fn prompt_title(prefix: &str) -> String {
         "/worktree" => "Worktree branch name (or: merge/land · off/exit)",
         "/land" => "Land changes. Commit message",
         "/wiki" => "Wiki search query",
+        "/roles save" => "Preset name (e.g. fast, myteam)",
         _ => "Enter a value",
     }
     .to_string()
@@ -3063,9 +3166,9 @@ fn apply_command(
     }
     if let Some(role) = command.strip_prefix("@role:") {
         app.selector = Some(if role == "all" {
-            harness_model_selector(registry, config, None, false)
+            harness_model_selector(registry, config, None, false, false)
         } else {
-            harness_model_selector(registry, config, Some(role), false)
+            harness_model_selector(registry, config, Some(role), false, false)
         });
         return;
     }
@@ -3077,10 +3180,35 @@ fn apply_command(
     // "Show all models…" from a short role picker → the full catalog.
     if let Some(role) = command.strip_prefix("@roleall:") {
         app.selector = Some(if role == "all" {
-            harness_model_selector(registry, config, None, true)
+            harness_model_selector(registry, config, None, true, false)
         } else {
-            harness_model_selector(registry, config, Some(role), true)
+            harness_model_selector(registry, config, Some(role), true, false)
         });
+        return;
+    }
+    // Wizard: chained pickers set planner → developer → reviewer in one pass.
+    if let Some(role) = command.strip_prefix("@wizard:") {
+        app.selector = Some(harness_model_selector(registry, config, Some(role), false, true));
+        return;
+    }
+    if let Some(role) = command.strip_prefix("@wizall:") {
+        app.selector = Some(harness_model_selector(registry, config, Some(role), true, true));
+        return;
+    }
+    if let Some(rest) = command.strip_prefix("@wizpick:")
+        && let Some((role, model_ref)) = rest.split_once(':')
+    {
+        run_command_quiet(app, store, registry, config, &format!("/roles {role} {model_ref}"));
+        app.status = status_line(store, registry, config);
+        app.selector = Some(match role {
+            "planner" => harness_model_selector(registry, config, Some("developer"), false, true),
+            "developer" => harness_model_selector(registry, config, Some("reviewer"), false, true),
+            _ => roles_selector(config),
+        });
+        return;
+    }
+    if command == "@delpreset" {
+        app.selector = Some(delete_preset_selector(config));
         return;
     }
     // Folder chosen in the codebase picker → switch the working directory.
@@ -3232,11 +3360,14 @@ fn apply_command(
     }
     // Picking a harness role model: apply it, then RETURN to the roles menu so
     // you can set several roles back-to-back instead of dropping to the chat
-    // after every pick. (A model set carries a "provider/id" ref; other /roles
-    // subcommands like show/clear/glm just run and return.)
+    // after every pick. Preset applies, glm/current/clear, and deletes also
+    // come back to the menu so the updated assignments are visible right away.
     if let Some(rest) = command.strip_prefix("/roles ") {
         // Model refs carry '/'; persona assignments carry " persona ".
-        let sets_assignment = rest.contains('/') || rest.contains(" persona ");
+        let sets_assignment = rest.contains('/')
+            || rest.contains(" persona ")
+            || rest.starts_with("delete ")
+            || !rest.trim().contains(' ');
         run_command_quiet(app, store, registry, config, command);
         app.status = status_line(store, registry, config);
         if sets_assignment {
@@ -6091,7 +6222,7 @@ mod tests {
             folder_selector(&config),
             provider_selector(&registry, &config),
             model_selector(&registry, &config, None, ""),
-            harness_model_selector(&registry, &config, None, false),
+            harness_model_selector(&registry, &config, None, false, false),
             roles_selector(&config),
             thinking_selector(crate::providers::ThinkingLevel::Medium),
             session_selector(&config),
@@ -6108,6 +6239,57 @@ mod tests {
                 selector.title
             );
         }
+    }
+
+    #[test]
+    fn roles_menu_offers_wizard_presets_and_save() {
+        let dir = std::env::temp_dir().join(format!("bbarit-roles-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = AppConfig::for_test(dir);
+        std::fs::write(
+            config.user_app_dir.join("harness-presets.json"),
+            r#"{"team":{"planner":"zai/glm-5.2","developer":"zai/glm-5.2-fast"}}"#,
+        )
+        .unwrap();
+
+        let selector = roles_selector(&config);
+        let has = |command: &str| selector.items.iter().any(|(_, c)| c == command);
+        assert!(has("@wizard:planner"), "wizard entry");
+        assert!(has("/roles save "), "save prompts for a name");
+        assert!(has("/roles team"), "saved preset applies in one tap");
+        assert!(has("@delpreset"), "delete submenu when presets exist");
+        // The preset row shows its models at a glance.
+        assert!(selector
+            .items
+            .iter()
+            .any(|(label, _)| label.contains("team") && label.contains("glm-5.2")));
+
+        let del = delete_preset_selector(&config);
+        assert!(del.items.iter().any(|(_, c)| c == "/roles delete team"));
+    }
+
+    #[test]
+    fn wizard_picker_chains_roles_in_order() {
+        let config = AppConfig::for_test(std::env::temp_dir().join("bbarit-wizard-picker"));
+        let registry = Registry::load(&config).unwrap();
+
+        let planner = harness_model_selector(&registry, &config, Some("planner"), false, true);
+        assert!(planner.title.starts_with("Step 1/3"));
+        assert!(
+            planner
+                .items
+                .iter()
+                .any(|(_, c)| c.starts_with("@wizpick:planner:")),
+            "wizard picks chain instead of running /roles directly"
+        );
+        // Skip keeps the current model and moves on to the next role.
+        assert!(planner.items.iter().any(|(_, c)| c == "@wizard:developer"));
+
+        let reviewer = harness_model_selector(&registry, &config, Some("reviewer"), false, true);
+        assert!(reviewer.title.starts_with("Step 3/3"));
+        // The last step's skip returns to the roles overview.
+        assert!(reviewer.items.iter().any(|(_, c)| c == "@back:roles"));
     }
 
     #[test]

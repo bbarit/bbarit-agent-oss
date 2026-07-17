@@ -199,15 +199,16 @@ fn read_config(config: &AppConfig) -> HashMap<String, ServerConfig> {
 }
 
 /// Claude Code / Codex interop: reuse their MCP servers and skills exactly as
-/// configured there. On by default; turn off with `BBARIT_INTEROP=0` (process
-/// env or the agent dotenv) or `/interop off`.
+/// configured there. OFF by default — bbarit-oss stays self-contained and does
+/// not spend prompt tokens on other tools' skill libraries. Enable with
+/// `BBARIT_INTEROP=1` (process env or the agent dotenv) or `/interop on`.
 pub fn interop_enabled() -> bool {
     let value = std::env::var("BBARIT_INTEROP")
         .ok()
         .or_else(|| crate::config::agent_env_var("BBARIT_INTEROP"));
-    !matches!(
+    matches!(
         value.as_deref().map(str::trim),
-        Some("0") | Some("false") | Some("off")
+        Some("1") | Some("true") | Some("on")
     )
 }
 
