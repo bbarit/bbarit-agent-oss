@@ -47,6 +47,13 @@ struct Server {
 
 static SERVERS: OnceLock<Mutex<HashMap<String, Server>>> = OnceLock::new();
 
+type ConfigCache = Option<(PathBuf, PathBuf, HashMap<String, ServerConfig>)>;
+static CONFIG_CACHE: OnceLock<Mutex<ConfigCache>> = OnceLock::new();
+
+fn config_cache() -> &'static Mutex<ConfigCache> {
+    CONFIG_CACHE.get_or_init(|| Mutex::new(None))
+}
+
 fn servers() -> &'static Mutex<HashMap<String, Server>> {
     SERVERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -87,6 +94,7 @@ fn activated_tools() -> &'static Mutex<HashSet<String>> {
 /// editing a server's command/args/env or removing it from .mcp.json does
 /// nothing until app restart. Returns how many running servers were stopped.
 pub fn reload_servers() -> usize {
+    *config_cache().lock().unwrap() = None;
     reset_failed_servers();
     activated_tools().lock().unwrap().clear();
     let mut map = servers().lock().unwrap();
@@ -137,6 +145,7 @@ pub fn add_server(
         .insert(name.to_string(), entry);
     std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&root)?))
         .with_context(|| format!("cannot write {}", path.display()))?;
+    *config_cache().lock().unwrap() = None;
     Ok(path)
 }
 
@@ -157,11 +166,29 @@ pub fn remove_server(config: &AppConfig, name: &str) -> Result<bool> {
     if removed {
         std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&root)?))
             .with_context(|| format!("cannot write {}", path.display()))?;
+        *config_cache().lock().unwrap() = None;
     }
     Ok(removed)
 }
 
 fn read_config(config: &AppConfig) -> HashMap<String, ServerConfig> {
+    if let Some((cwd, user_app_dir, configs)) = config_cache().lock().unwrap().as_ref()
+        && *cwd == config.cwd
+        && *user_app_dir == config.user_app_dir
+    {
+        return configs.clone();
+    }
+
+    let configs = read_config_uncached(config);
+    *config_cache().lock().unwrap() = Some((
+        config.cwd.clone(),
+        config.user_app_dir.clone(),
+        configs.clone(),
+    ));
+    configs
+}
+
+fn read_config_uncached(config: &AppConfig) -> HashMap<String, ServerConfig> {
     let mut out = HashMap::new();
     // First entry wins on a name clash: project, then own user config, then
     // (when interop is on) Claude Code's and Codex's own configs, untouched.

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -579,7 +580,45 @@ pub fn run_extension_runtime_command(
     Ok(runtime_outputs_to_text(&value))
 }
 
+type ToolSpecsCache = Option<(String, Vec<crate::tools::ToolSpec>)>;
+static TOOL_SPECS_CACHE: OnceLock<Mutex<ToolSpecsCache>> = OnceLock::new();
+
+fn tool_specs_cache() -> &'static Mutex<ToolSpecsCache> {
+    TOOL_SPECS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn tool_specs_cache_key(config: &AppConfig) -> String {
+    format!(
+        "{:?}",
+        (
+            &config.cwd,
+            &config.app_dir,
+            &config.user_app_dir,
+            config.no_extensions,
+            &config.extension_paths,
+            &config.packages,
+        )
+    )
+}
+
+pub fn invalidate_tool_specs_cache() {
+    *tool_specs_cache().lock().unwrap() = None;
+}
+
 pub fn load_extension_tool_specs(config: &AppConfig) -> Result<Vec<crate::tools::ToolSpec>> {
+    let key = tool_specs_cache_key(config);
+    if let Some((cached_key, specs)) = tool_specs_cache().lock().unwrap().as_ref()
+        && *cached_key == key
+    {
+        return Ok(specs.clone());
+    }
+
+    let specs = load_extension_tool_specs_uncached(config)?;
+    *tool_specs_cache().lock().unwrap() = Some((key, specs.clone()));
+    Ok(specs)
+}
+
+fn load_extension_tool_specs_uncached(config: &AppConfig) -> Result<Vec<crate::tools::ToolSpec>> {
     let mut specs = Vec::new();
     let mut seen = BTreeSet::new();
     for extension in load_extensions(config)? {

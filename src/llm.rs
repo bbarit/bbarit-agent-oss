@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::{env, fs};
 
 use anyhow::{Result, anyhow, bail};
@@ -490,22 +491,7 @@ pub fn complete_with_tools(
     let provider = registry
         .provider(&model.provider)
         .ok_or_else(|| anyhow!("unknown provider {}", model.provider))?;
-    let client = {
-        // TCP keepalive keeps the socket alive through long SILENT stretches — a
-        // big model "thinking" (opus:high extended thinking) or streaming a large
-        // file can go many seconds with no bytes, and without keepalive the OS/
-        // network drops the idle connection → "error decoding response body:
-        // operation timed out" mid-task. Applies to every provider.
-        let mut builder = Client::builder().tcp_keepalive(std::time::Duration::from_secs(20));
-        // Local Ollama models can take a minute or more to cold-load a large model
-        // before the first byte arrives. The default request timeout cuts that off
-        // ("operation timed out" mid-load), so give local models a generous ceiling.
-        // Cloud providers keep the default (no total timeout) so long streams run.
-        if model.provider == "ollama" {
-            builder = builder.timeout(std::time::Duration::from_secs(900));
-        }
-        builder.build()?
-    };
+    let client = shared_client(model.provider == "ollama")?;
     let tools = configured_tool_specs(config, enable_tools);
     let request_config = registry.request_config(&model.provider, &model.id);
     if let Some(completion) =
@@ -517,7 +503,7 @@ pub fn complete_with_tools(
         ApiKind::OpenAiResponses => {
             let api_key = resolve_api_key(config, provider)?;
             openai_responses(ProviderCall {
-                client: &client,
+                client,
                 model,
                 thinking,
                 messages,
@@ -529,16 +515,16 @@ pub fn complete_with_tools(
         }
         ApiKind::AzureOpenAiResponses => {
             let api_key = resolve_api_key(config, provider)?;
-            azure_openai_responses(&client, model, thinking, messages, &api_key, config, &tools)
+            azure_openai_responses(client, model, thinking, messages, &api_key, config, &tools)
         }
         ApiKind::OpenAiCodexResponses => {
             let api_key = resolve_api_key(config, provider)?;
-            openai_codex_responses(&client, model, thinking, messages, &api_key, config, &tools)
+            openai_codex_responses(client, model, thinking, messages, &api_key, config, &tools)
         }
         ApiKind::OpenAiCompletions => {
             let api_key = resolve_api_key(config, provider)?;
             openai_completions(ProviderCall {
-                client: &client,
+                client,
                 model,
                 thinking,
                 messages,
@@ -551,7 +537,7 @@ pub fn complete_with_tools(
         ApiKind::AnthropicMessages => {
             let api_key = resolve_api_key(config, provider)?;
             anthropic_messages(ProviderCall {
-                client: &client,
+                client,
                 model,
                 thinking,
                 messages,
@@ -563,12 +549,12 @@ pub fn complete_with_tools(
         }
         ApiKind::GoogleGenerativeAi => {
             let api_key = resolve_api_key(config, provider)?;
-            google_generate_content(&client, model, thinking, messages, &api_key, config, &tools)
+            google_generate_content(client, model, thinking, messages, &api_key, config, &tools)
         }
         ApiKind::GoogleVertex => {
             let api_key = resolve_optional_api_key(config, provider)?;
             google_vertex_generate_content(
-                &client,
+                client,
                 model,
                 thinking,
                 messages,
@@ -580,7 +566,7 @@ pub fn complete_with_tools(
         ApiKind::MistralConversations => {
             let api_key = resolve_api_key(config, provider)?;
             mistral_conversations(ProviderCall {
-                client: &client,
+                client,
                 model,
                 thinking,
                 messages,
@@ -591,7 +577,7 @@ pub fn complete_with_tools(
             })
         }
         ApiKind::BedrockConverse => {
-            bedrock_converse(&client, model, thinking, messages, config, &tools)
+            bedrock_converse(client, model, thinking, messages, config, &tools)
         }
         ApiKind::Unsupported => bail!(
             "model {} uses API '{}' which is not implemented in bbarit yet",
@@ -599,6 +585,30 @@ pub fn complete_with_tools(
             model.api
         ),
     }
+}
+
+fn shared_client(local_model: bool) -> Result<&'static Client> {
+    type CachedClient = std::result::Result<Client, String>;
+    static CLOUD_CLIENT: OnceLock<CachedClient> = OnceLock::new();
+    static LOCAL_CLIENT: OnceLock<CachedClient> = OnceLock::new();
+
+    let slot = if local_model {
+        &LOCAL_CLIENT
+    } else {
+        &CLOUD_CLIENT
+    };
+    slot.get_or_init(|| {
+        // Reusing a Client preserves its connection pool between agent rounds,
+        // avoiding a fresh TCP/TLS handshake for every tool-call continuation.
+        let mut builder = Client::builder().tcp_keepalive(std::time::Duration::from_secs(20));
+        if local_model {
+            // Ollama can take a minute or more to cold-load a large model.
+            builder = builder.timeout(std::time::Duration::from_secs(900));
+        }
+        builder.build().map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map_err(|error| anyhow!("failed to build HTTP client: {error}"))
 }
 
 fn extension_stream_simple_completion(
@@ -1462,7 +1472,7 @@ fn openai_responses(call: ProviderCall) -> Result<Completion> {
         base_url(model, config)?.trim_end_matches('/')
     );
     let mut input = Vec::new();
-    if let Some(system) = system_text(config) {
+    if let Some(system) = system_text(config, tools) {
         input.push(json!({"role": "developer", "content": system}));
     }
     input.extend(
@@ -1514,7 +1524,7 @@ fn azure_openai_responses(
         urlencoding::encode(&api_version)
     );
     let mut input = Vec::new();
-    if let Some(system) = system_text(config) {
+    if let Some(system) = system_text(config, tools) {
         input.push(json!({"role": "developer", "content": system}));
     }
     input.extend(
@@ -1633,7 +1643,7 @@ fn openai_codex_responses(
         "model": model.id,
         "store": false,
         "stream": true,
-        "instructions": system_text(config).unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+        "instructions": system_text(config, tools).unwrap_or_else(|| "You are a helpful assistant.".to_string()),
         "input": input,
         "text": {"verbosity": "low"},
         "include": ["reasoning.encrypted_content"],
@@ -2052,7 +2062,7 @@ fn openai_completions(call: ProviderCall) -> Result<Completion> {
         base_url(model, config)?.trim_end_matches('/')
     );
     let mut converted = Vec::new();
-    if let Some(system) = system_text(config) {
+    if let Some(system) = system_text(config, tools) {
         converted.push(json!({"role": "system", "content": system}));
     }
     converted.extend(
@@ -2603,7 +2613,7 @@ fn mistral_conversations(call: ProviderCall) -> Result<Completion> {
         mistral_base_url(model, config)?.trim_end_matches('/')
     );
     let mut converted = Vec::new();
-    if let Some(system) = system_text(config) {
+    if let Some(system) = system_text(config, tools) {
         converted.push(json!({"role": "system", "content": system}));
     }
     converted.extend(
@@ -2782,7 +2792,7 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
         "messages": messages,
     });
     apply_anthropic_thinking(&mut body, model, thinking, max_tokens);
-    let system = system_text(config);
+    let system = system_text(config, tools);
     let mut system_blocks: Vec<Value> = Vec::new();
     if is_oauth {
         // OAuth requests MUST lead with the Claude Code identity block.
@@ -3063,7 +3073,7 @@ fn google_generate_content(
         }
     });
     apply_gemini_thinking(&mut body, model, thinking);
-    if let Some(system) = system_text(config) {
+    if let Some(system) = system_text(config, tools) {
         body["systemInstruction"] = json!({"parts": [{"text": system}]});
     }
     if !tools.is_empty() {
@@ -3136,7 +3146,7 @@ fn google_vertex_generate_content(
         }
     });
     apply_gemini_thinking(&mut body, model, thinking);
-    if let Some(system) = system_text(config) {
+    if let Some(system) = system_text(config, tools) {
         body["systemInstruction"] = json!({"parts": [{"text": system}]});
     }
     if !tools.is_empty() {
@@ -3300,7 +3310,7 @@ fn bedrock_converse(
             });
         }
     }
-    if let Some(system) = system_text(config) {
+    if let Some(system) = system_text(config, tools) {
         body["system"] = json!([{"text": system}]);
     }
     if !tools.is_empty() {
@@ -3372,8 +3382,8 @@ fn bedrock_converse(
     })
 }
 
-fn system_text(config: &AppConfig) -> Option<String> {
-    Some(build_system_prompt(config))
+fn system_text(config: &AppConfig, tools: &[ToolSpec]) -> Option<String> {
+    Some(build_system_prompt_with_tools(config, tools))
 }
 
 fn xml_escape_text(text: &str) -> String {
@@ -3443,7 +3453,13 @@ fn build_project_wiki_block(config: &AppConfig) -> Option<String> {
     Some(out)
 }
 
+#[cfg(test)]
 fn build_system_prompt(config: &AppConfig) -> String {
+    let tools = configured_tool_specs(config, true);
+    build_system_prompt_with_tools(config, &tools)
+}
+
+fn build_system_prompt_with_tools(config: &AppConfig, tools: &[ToolSpec]) -> String {
     let cwd = config.cwd.display().to_string().replace('\\', "/");
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
 
@@ -3462,7 +3478,6 @@ fn build_system_prompt(config: &AppConfig) -> String {
         }
     };
 
-    let tools = configured_tool_specs(config, true);
     let has = |name: &str| {
         tools
             .iter()
@@ -5932,6 +5947,31 @@ mod tests {
         assert!(prompt.contains("Lead with the outcome"));
         assert!(prompt.contains("Current date: "));
         assert!(prompt.contains("Current working directory: "));
+    }
+
+    #[test]
+    fn system_prompt_reuses_the_request_tool_snapshot() {
+        let dir = std::env::temp_dir().join("bbarit-sysprompt-tool-snapshot");
+        let _ = std::fs::create_dir_all(&dir);
+        let config = AppConfig::for_test(dir);
+
+        let prompt = build_system_prompt_with_tools(&config, &[]);
+
+        assert!(prompt.contains("Available tools:\n(none)"));
+        assert!(!prompt.contains("EXECUTE, don't instruct"));
+        assert!(!prompt.contains("ALWAYS test what you build"));
+    }
+
+    #[test]
+    fn http_clients_are_reused_and_keep_local_timeout_separate() {
+        let cloud_a = shared_client(false).unwrap();
+        let cloud_b = shared_client(false).unwrap();
+        let local_a = shared_client(true).unwrap();
+        let local_b = shared_client(true).unwrap();
+
+        assert!(std::ptr::eq(cloud_a, cloud_b));
+        assert!(std::ptr::eq(local_a, local_b));
+        assert!(!std::ptr::eq(cloud_a, local_a));
     }
 
     #[test]

@@ -1461,6 +1461,7 @@ fn format_changelog() -> String {
 
 fn reload_resources(config: &AppConfig) -> Result<String> {
     crate::resources::invalidate_skills_cache();
+    crate::extensions::invalidate_tool_specs_cache();
     let prompts = crate::resources::load_prompts(config)?.len();
     let skills = crate::resources::load_skills(config)?.len();
     let themes = crate::themes::load_themes(config)?.len();

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -44,8 +44,7 @@ const CORE_BUILTIN_TOOLS: &[&str] = &[
     "todo",
 ];
 
-static ACTIVATED_BUILTIN_TOOLS: std::sync::OnceLock<Mutex<HashSet<String>>> =
-    std::sync::OnceLock::new();
+static ACTIVATED_BUILTIN_TOOLS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn activated_builtin_tools() -> &'static Mutex<HashSet<String>> {
     ACTIVATED_BUILTIN_TOOLS.get_or_init(|| Mutex::new(HashSet::new()))
@@ -72,7 +71,7 @@ impl ToolSpec {
     }
 }
 
-pub fn built_in_tool_specs() -> Vec<ToolSpec> {
+fn create_builtin_tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec::new(
             "read",
@@ -625,6 +624,21 @@ pub fn built_in_tool_specs() -> Vec<ToolSpec> {
     specs
 }
 
+fn cached_builtin_tool_specs() -> &'static [ToolSpec] {
+    static MAIN: OnceLock<Vec<ToolSpec>> = OnceLock::new();
+    static SUBAGENT: OnceLock<Vec<ToolSpec>> = OnceLock::new();
+    let cache = if crate::orchestrator::is_subagent() {
+        &SUBAGENT
+    } else {
+        &MAIN
+    };
+    cache.get_or_init(create_builtin_tool_specs)
+}
+
+pub fn built_in_tool_specs() -> Vec<ToolSpec> {
+    cached_builtin_tool_specs().to_vec()
+}
+
 fn available_builtin_tool_specs(config: &AppConfig) -> Vec<ToolSpec> {
     built_in_tool_specs()
         .into_iter()
@@ -633,13 +647,18 @@ fn available_builtin_tool_specs(config: &AppConfig) -> Vec<ToolSpec> {
         .collect()
 }
 
+#[cfg(test)]
 fn lazy_builtin_tool_specs(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    lazy_builtin_tool_spec_refs(specs.iter())
+}
+
+fn lazy_builtin_tool_spec_refs<'a>(specs: impl IntoIterator<Item = &'a ToolSpec>) -> Vec<ToolSpec> {
     let activated = activated_builtin_tools().lock().unwrap();
     let mut index = String::new();
     let mut kept = Vec::new();
     for spec in specs {
         if CORE_BUILTIN_TOOLS.contains(&spec.name.as_str()) || activated.contains(&spec.name) {
-            kept.push(spec);
+            kept.push(spec.clone());
         } else {
             let compact = spec
                 .description
@@ -671,6 +690,15 @@ fn lazy_builtin_tool_specs(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
         kept.push(finder);
     }
     kept
+}
+
+fn configured_builtin_tool_specs(config: &AppConfig) -> Vec<ToolSpec> {
+    lazy_builtin_tool_spec_refs(
+        cached_builtin_tool_specs()
+            .iter()
+            .filter(|tool| tool_enabled(config, &tool.name))
+            .filter(|tool| tool.name != "computer" || crate::computer::computer_use_enabled()),
+    )
 }
 
 /// Activate up to eight deferred built-ins matching `query`. The next agent
@@ -729,7 +757,7 @@ pub fn configured_tool_specs(config: &AppConfig, enable_tools: bool) -> Vec<Tool
     let mut specs = if config.no_builtin_tools {
         Vec::new()
     } else {
-        lazy_builtin_tool_specs(available_builtin_tool_specs(config))
+        configured_builtin_tool_specs(config)
     };
     if let Ok(extension_tools) = crate::extensions::load_extension_tool_specs(config) {
         for tool in extension_tools
@@ -4992,6 +5020,15 @@ mod tests {
                 .iter()
                 .all(|spec| spec.name != "__lazy_specialist_test__")
         );
+    }
+
+    #[test]
+    fn builtin_schema_catalog_is_constructed_once() {
+        let first = cached_builtin_tool_specs();
+        let second = cached_builtin_tool_specs();
+
+        assert!(std::ptr::eq(first, second));
+        assert!(!first.is_empty());
     }
 
     #[test]
