@@ -181,7 +181,16 @@ curl -fsSL https://bbarit.com/agent/install.sh | sh
 ```
 
 Downloads a prebuilt `bbarit-oss` binary for your platform and installs it into
-`~/.local/bin` (override with `BBARIT_INSTALL_DIR`). Windows binaries are
+`~/.local/bin` (override with `BBARIT_INSTALL_DIR`).
+
+### One line (Windows, PowerShell)
+
+```powershell
+irm https://bbarit.com/agent/install.ps1 | iex
+```
+
+Installs into `%LOCALAPPDATA%\Programs\bbarit-oss` (override with
+`BBARIT_INSTALL_DIR`) and adds it to your user PATH. Binaries are also
 published on the [releases page](https://github.com/bbarit/bbarit-agent-oss/releases).
 
 ### From source

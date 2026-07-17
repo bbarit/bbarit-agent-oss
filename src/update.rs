@@ -18,6 +18,9 @@ pub fn target_key() -> Option<&'static str> {
         ("linux", "x86_64") => "linux-x64",
         ("linux", "aarch64") => "linux-arm64",
         ("windows", "x86_64") => "windows-x64",
+        // No native arm64 Windows build yet; Windows-on-ARM runs the x64
+        // binary under emulation, so upgrades (and installs) use that.
+        ("windows", "aarch64") => "windows-x64",
         _ => return None,
     })
 }

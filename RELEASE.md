@@ -39,8 +39,9 @@ Pushing the `v*` tag triggers **`.github/workflows/release.yml`**, which:
 1. Builds a release binary for all five targets on GitHub-hosted runners.
 2. Generates `latest.json` (version + per-platform download URLs).
 3. Publishes a **GitHub Release** with every binary + `latest.json`.
-4. If deploy secrets are set, uploads the binaries, `latest.json`, and
-   `install.sh` to **bbarit.com** so the `curl` installer and `--upgrade` resolve.
+4. If deploy secrets are set, uploads the binaries, `latest.json`,
+   `install.sh`, and `install.ps1` to **bbarit.com** so the installers and
+   `--upgrade` resolve.
 
 ## One-time GitHub setup
 
@@ -75,13 +76,16 @@ FROM_GH=1 ./scripts/deploy-bbarit-com.sh     # pull all platforms from the GH re
 # Fresh install (macOS / Linux)
 curl -fsSL https://bbarit.com/agent/install.sh | sh
 
-# Update in place, any time
+# Fresh install (Windows, PowerShell)
+irm https://bbarit.com/agent/install.ps1 | iex
+
+# Update in place, any time (all platforms)
 bbarit-oss --upgrade
 ```
 
 `bbarit-oss --upgrade` reads `https://bbarit.com/agent/latest.json`, and if a newer
-version exists, downloads the matching binary and atomically replaces itself.
-Windows users download from the GitHub releases page (or re-run the installer).
+version exists, downloads the matching binary and atomically replaces itself
+(on Windows the running exe is moved aside first).
 
 ## Nginx (server side)
 
@@ -94,7 +98,7 @@ location /agent/ {
 }
 ```
 
-`install.sh`, `latest.json`, and `dist/<version>/bbarit-<target>` then live under
+`install.sh`, `install.ps1`, `latest.json`, and `dist/<version>/bbarit-<target>` then live under
 `https://bbarit.com/agent/`.
 
 ## Local build

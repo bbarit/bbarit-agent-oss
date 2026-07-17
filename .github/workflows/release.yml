@@ -108,4 +108,4 @@ jobs:
           # job red — install.sh and --upgrade read ONLY bbarit.com, so a
           # green run with a failed deploy would silently strand users.
           scp -i ~/.ssh/id -o StrictHostKeyChecking=no staging/bbarit-oss-* "$SSH_USER@$SSH_HOST:$REMOTE_ROOT/dist/$VERSION/"
-          scp -i ~/.ssh/id -o StrictHostKeyChecking=no staging/latest.json install.sh "$SSH_USER@$SSH_HOST:$REMOTE_ROOT/"
+          scp -i ~/.ssh/id -o StrictHostKeyChecking=no staging/latest.json install.sh install.ps1 "$SSH_USER@$SSH_HOST:$REMOTE_ROOT/"

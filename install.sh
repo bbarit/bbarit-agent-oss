@@ -26,7 +26,7 @@ case "$os" in
             aarch64|arm64) target="linux-arm64" ;;
             *) err "unsupported Linux arch: $arch" ;;
           esac ;;
-  *) err "unsupported OS: $os (Windows: download from the GitHub releases page)" ;;
+  *) err "unsupported OS: $os (Windows PowerShell:  irm https://bbarit.com/agent/install.ps1 | iex)" ;;
 esac
 
 command -v curl >/dev/null 2>&1 || err "curl is required"

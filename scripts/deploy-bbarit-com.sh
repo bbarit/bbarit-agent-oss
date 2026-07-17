@@ -52,11 +52,12 @@ cat > .deploy/latest.json <<JSON
 }
 JSON
 cp install.sh .deploy/install.sh
+cp install.ps1 .deploy/install.ps1
 
 echo "Uploading…"
 ssh "$BBARIT_SSH" "mkdir -p '$BBARIT_AGENT_ROOT/dist/$VERSION'"
 rsync -av ".deploy/dist/$VERSION/" "$BBARIT_SSH:$BBARIT_AGENT_ROOT/dist/$VERSION/"
-rsync -av .deploy/latest.json .deploy/install.sh "$BBARIT_SSH:$BBARIT_AGENT_ROOT/"
+rsync -av .deploy/latest.json .deploy/install.sh .deploy/install.ps1 "$BBARIT_SSH:$BBARIT_AGENT_ROOT/"
 
 rm -rf .deploy
 echo "Done. Verify:  curl -fsSL https://bbarit.com/agent/latest.json"

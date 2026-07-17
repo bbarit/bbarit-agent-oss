@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.12]
+
+- Windows one-line install: `irm https://bbarit.com/agent/install.ps1 | iex`
+  downloads the x64 binary into `%LOCALAPPDATA%\Programs\bbarit-oss` and adds
+  it to the user PATH.
+- `--upgrade` now works on Windows-on-ARM (Parallels et al.): a natively built
+  arm64 binary reported "unsupported platform" because the release matrix has
+  no arm64 Windows build — it now upgrades to the x64 binary, which runs under
+  Windows emulation.
+
 ## [0.1.11]
 
 - Esc now interrupts a codex websocket request that is stuck connecting. The
