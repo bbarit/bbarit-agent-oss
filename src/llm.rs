@@ -1816,6 +1816,64 @@ fn codex_model_uses_responses_lite(model_id: &str) -> bool {
 /// frame out, then the same JSON events the SSE endpoint emits, one per frame.
 /// Frames are re-wrapped as `data:` lines so extract_codex_sse_completion can
 /// parse the result exactly like the HTTP path.
+/// Bounded dial for the codex websocket: explicit TCP connect timeout plus a
+/// handshake-phase read/write timeout. `tungstenite::connect` provides
+/// neither, so a peer that accepts TCP but stalls the TLS/upgrade handshake
+/// would block forever.
+fn codex_websocket_dial(
+    request: tungstenite::handshake::client::Request,
+) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>> {
+    use std::net::ToSocketAddrs;
+
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow!("codex websocket URL has no host"))?
+        .to_string();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("ws") {
+        80
+    } else {
+        443
+    });
+    let mut last_error: Option<std::io::Error> = None;
+    let mut stream = None;
+    for addr in (host.as_str(), port).to_socket_addrs()? {
+        match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(15)) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let Some(stream) = stream else {
+        let detail = last_error
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        bail!("codex websocket: cannot connect to {host}:{port}{detail}");
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+    let (socket, _upgrade) = tungstenite::client_tls(request, stream).map_err(|err| match err {
+        tungstenite::handshake::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
+            let status = response.status();
+            let detail = response
+                .body()
+                .as_ref()
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
+                .unwrap_or_default();
+            anyhow!("codex websocket upgrade failed with HTTP {status}: {detail}")
+        }
+        tungstenite::handshake::HandshakeError::Failure(other) => {
+            anyhow!("codex websocket connect failed: {other}")
+        }
+        tungstenite::handshake::HandshakeError::Interrupted(_) => {
+            anyhow!("codex websocket handshake stalled past its timeout")
+        }
+    })?;
+    Ok(socket)
+}
+
 fn codex_responses_over_websocket(
     url: &str,
     api_key: &str,
@@ -1863,18 +1921,31 @@ fn codex_responses_over_websocket(
     headers.insert("User-Agent", "codex_cli_rs/0.144.1".parse()?);
     headers.insert("OpenAI-Beta", "responses_websockets=2026-02-06".parse()?);
 
-    let (mut socket, _upgrade) = tungstenite::connect(request).map_err(|err| match err {
-        tungstenite::Error::Http(response) => {
-            let status = response.status();
-            let detail = response
-                .body()
-                .as_ref()
-                .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
-                .unwrap_or_default();
-            anyhow!("codex websocket upgrade failed with HTTP {status}: {detail}")
+    // Dial + TLS/upgrade handshake on a helper thread, polled against the
+    // cancel flag: tungstenite::connect has no timeout hooks, so a peer that
+    // stalls mid-handshake otherwise pins the turn — and swallows Esc — until
+    // the server gives up (minutes, in practice). The frame loop below stays
+    // on this thread because the stream sink is thread-local; its 1s read
+    // timeout keeps it Esc-responsive.
+    let mut socket = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(codex_websocket_dial(request));
+        });
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(result) => break result?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if crate::commands::cancel_requested() {
+                        bail!("request cancelled");
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("codex websocket dial thread ended unexpectedly")
+                }
+            }
         }
-        other => anyhow!("codex websocket connect failed: {other}"),
-    })?;
+    };
     // Short socket timeout so Esc cancellation stays responsive; the overall
     // idle budget below matches the HTTP stream behaviour.
     match socket.get_ref() {
@@ -5271,6 +5342,22 @@ fn finalize_tool_arguments(name: &str, partial: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_websocket_dial_errors_fast_on_closed_port() {
+        use tungstenite::client::IntoClientRequest;
+        // Grab a free port, then close it so the dial gets connection-refused:
+        // the bounded dial must error promptly instead of hanging the turn.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let request = format!("ws://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(super::codex_websocket_dial(request).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
     #[test]
     fn gemini_schema_sanitizer_strips_unsupported_keywords_recursively() {
         let dirty = json!({

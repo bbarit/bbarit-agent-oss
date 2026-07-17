@@ -1481,6 +1481,30 @@ fn short_when(iso: &str) -> String {
     format!("{date} {time}").trim().to_string()
 }
 
+/// Compact "N ago" for the resume list, e.g. "5m ago" / "2h ago" / "3d ago".
+fn format_ago(secs: u64) -> String {
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// How long since the session file was last written (= last activity).
+/// Empty when the file cannot be read, so the label degrades gracefully.
+fn session_ago(path: &str) -> String {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| format_ago(elapsed.as_secs()))
+        .unwrap_or_default()
+}
+
 /// Pick the reasoning effort. Each model maps these to its own scale, so a menu
 /// is far easier than remembering per-model names. The current level is marked.
 fn thinking_selector(current: crate::providers::ThinkingLevel) -> Selector {
@@ -1533,7 +1557,12 @@ fn session_selector(config: &AppConfig) -> Selector {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let label = format!("{name}  -  {count}  -  {}", short_when(created));
+                let ago = session_ago(&path);
+                let label = if ago.is_empty() {
+                    format!("{name}  -  {count}  -  {}", short_when(created))
+                } else {
+                    format!("{name}  -  {count}  -  {}  -  {ago}", short_when(created))
+                };
                 Some((label, format!("/resume {path}")))
             }),
     );
@@ -5603,6 +5632,18 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn format_ago_scales_units() {
+        assert_eq!(format_ago(0), "just now");
+        assert_eq!(format_ago(59), "just now");
+        assert_eq!(format_ago(60), "1m ago");
+        assert_eq!(format_ago(3599), "59m ago");
+        assert_eq!(format_ago(3600), "1h ago");
+        assert_eq!(format_ago(86_399), "23h ago");
+        assert_eq!(format_ago(86_400), "1d ago");
+        assert_eq!(format_ago(30 * 86_400), "30d ago");
+    }
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
