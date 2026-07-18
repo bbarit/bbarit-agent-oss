@@ -120,15 +120,15 @@ fn create_builtin_tool_specs() -> Vec<ToolSpec> {
              keep running, pass `background: true`: it becomes a managed job and the call returns \
              immediately with a job id — follow or stop it with the `job` tool (tail/kill). \
              Only run a program in the foreground when you expect it to finish quickly. A foreground \
-             command with NO explicit timeout still running after 60s is automatically converted to a \
-             background job (not a failure — follow it with `job`). \
-             Default timeout is 600s; pass an explicit larger `timeout` to wait in the foreground for a long build.",
+             command with no timeout, or a long timeout (120s+), still running after 60s is automatically \
+             converted to a background job (not a failure — follow it with `job`). Short explicit timeouts \
+             remain hard deadlines. Default timeout is 600s.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "description": {"type": "string", "description": "One short active-voice sentence saying what this command does, shown to the user (e.g. 'Install package dependencies'). Add it when the command is not obvious at a glance (pipes, obscure flags); skip for trivial commands."},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 600). Foreground programs that never exit are killed at the timeout — use background:true for those instead."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 600). Values below 120 are hard deadlines; long-running commands become managed jobs after 60s. Use background:true immediately for servers."},
                     "background": {"type": "boolean", "description": "Run detached and return immediately with pid + log file path. Use for servers, GUI apps, watchers, and long jobs you want to keep running."}
                 },
                 "required": ["command"]
@@ -871,16 +871,13 @@ pub fn execute_tool(cwd: &Path, name: &str, args: &Value) -> Result<String> {
                 run_shell_background(cwd, shell_path, &command)
             } else {
                 let explicit_timeout = optional_usize(args, "timeout");
-                // Auto-background only when the model did NOT choose a timeout:
-                // an explicit timeout means "wait for it"; the default means the
-                // model probably underestimated a server/build, so after 60s the
-                // command is converted to a job instead of blocking the turn.
-                let auto_bg = if explicit_timeout.is_some()
-                    || std::env::var("BBARIT_NO_AUTO_BG").ok().as_deref() == Some("1")
-                {
+                // Preserve short explicit deadlines, but keep the safety net for
+                // long values models commonly attach to builds/probes (e.g. 180s).
+                // Such work becomes a managed job instead of a terminal tool error.
+                let auto_bg = if std::env::var("BBARIT_NO_AUTO_BG").ok().as_deref() == Some("1") {
                     None
                 } else {
-                    Some(60)
+                    auto_background_threshold(explicit_timeout)
                 };
                 let result = run_shell_impl(
                     cwd,
@@ -3386,6 +3383,13 @@ pub(crate) fn strip_ansi_and_control(text: &str) -> String {
         }
     }
     out
+}
+
+fn auto_background_threshold(explicit_timeout: Option<usize>) -> Option<u64> {
+    match explicit_timeout {
+        Some(seconds) if (1..120).contains(&seconds) => None,
+        _ => Some(60),
+    }
 }
 
 pub fn run_shell(
@@ -6353,6 +6357,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
         }
         panic!("auto-backgrounded job never finished");
+    }
+
+    #[test]
+    fn long_explicit_timeout_keeps_auto_background_safety_net() {
+        assert_eq!(auto_background_threshold(None), Some(60));
+        assert_eq!(auto_background_threshold(Some(180)), Some(60));
+        assert_eq!(auto_background_threshold(Some(600)), Some(60));
+        assert_eq!(auto_background_threshold(Some(30)), None);
+        assert_eq!(auto_background_threshold(Some(119)), None);
     }
 
     #[test]

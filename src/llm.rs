@@ -1371,11 +1371,28 @@ fn send_with_retry(request: RequestBuilder, config: &AppConfig, body: Value) -> 
                 if attempt < max_retries
                     && (error.is_timeout() || error.is_connect() || error.is_request())
                 {
+                    let next_attempt = attempt + 1;
+                    let reason = if error.is_timeout() {
+                        "provider connection timed out"
+                    } else if error.is_connect() {
+                        "provider connection failed"
+                    } else {
+                        "provider request failed"
+                    };
+                    emit_activity(&format!(
+                        "\n⚙ {reason} — retrying ({next_attempt}/{max_retries})\n"
+                    ));
                     if interruptible_sleep(backoff_delay(attempt)) {
                         bail!("request cancelled");
                     }
                     attempt += 1;
                     continue;
+                }
+                if error.is_timeout() {
+                    bail!(
+                        "provider request timed out after {} attempt(s): {error}. Retry the task; if the timeout persists, lower /thinking or switch provider/model",
+                        attempt + 1
+                    );
                 }
                 return Err(error.into());
             }
@@ -2697,6 +2714,14 @@ fn mistral_uses_reasoning_effort(model: &Model) -> bool {
     )
 }
 
+fn anthropic_stream_transport_enabled(config_stream: bool, provider: &str) -> bool {
+    // Kimi's high-thinking responses can remain silent long enough for the
+    // non-streaming request to hit an OS/proxy timeout. SSE yields response
+    // headers immediately and also enables the existing reconnect/recovery
+    // path. This is only a transport choice; callers can still omit a UI sink.
+    config_stream || provider == "kimi-coding"
+}
+
 fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
     let ProviderCall {
         client,
@@ -2842,6 +2867,7 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
         }
         body["tools"] = json!(tool_defs);
     }
+    let use_stream = anthropic_stream_transport_enabled(config.stream, &model.provider);
     // Diagnostics: record exactly what we send (max_tokens, thinking config) so a
     // truncated write can be traced to the request, not guessed at.
     let _ = std::fs::write(
@@ -2852,11 +2878,11 @@ fn anthropic_messages(call: ProviderCall) -> Result<Completion> {
             "model_declared_max_tokens": model.max_tokens,
             "thinking": body.get("thinking"),
             "output_config": body.get("output_config"),
-            "stream": config.stream,
+            "stream": use_stream,
         }))
         .unwrap_or_default(),
     );
-    if config.stream {
+    if use_stream {
         body["stream"] = json!(true);
         // send_with_retry only covers errors up to the HTTP response; the
         // provider can still decline mid-stream with an in-stream `error`
@@ -6238,6 +6264,13 @@ mod tests {
         assert!(std::ptr::eq(cloud_a, cloud_b));
         assert!(std::ptr::eq(local_a, local_b));
         assert!(!std::ptr::eq(cloud_a, local_a));
+    }
+
+    #[test]
+    fn kimi_uses_stream_transport_even_when_ui_streaming_is_disabled() {
+        assert!(anthropic_stream_transport_enabled(false, "kimi-coding"));
+        assert!(anthropic_stream_transport_enabled(true, "anthropic"));
+        assert!(!anthropic_stream_transport_enabled(false, "anthropic"));
     }
 
     #[test]
