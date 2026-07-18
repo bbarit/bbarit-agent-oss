@@ -121,7 +121,7 @@ pub fn available_update() -> Option<String> {
 /// When `BBARIT_AUTO_UPGRADE` is on, upgrade in place at startup before the UI
 /// opens. Blocking but bounded; failures are reported and otherwise ignored so
 /// a bad network never blocks launch. Returns a one-line status when it acted.
-pub fn maybe_auto_upgrade_at_startup() -> Option<String> {
+pub fn maybe_auto_upgrade_at_startup() -> Option<(String, bool)> {
     if !auto_upgrade_enabled() {
         return None;
     }
@@ -137,20 +137,20 @@ pub fn maybe_auto_upgrade_at_startup() -> Option<String> {
         .bytes()
         .ok()?;
     if bytes.len() < 1024 {
-        return Some(format!(
-            "auto-upgrade: skipped (download for v{version} looked invalid)"
+        return Some((
+            format!("auto-upgrade: skipped (download for v{version} looked invalid)"),
+            false,
         ));
     }
     let exe = std::env::current_exe().ok()?;
     match replace_executable(&exe, &bytes) {
-        Ok(()) => Some(format!(
-            "auto-upgraded v{current} → v{version} (restart to run it)"
-        )),
-        Err(err) => Some(format!("auto-upgrade to v{version} failed: {err}")),
+        Ok(()) => Some((format!("auto-upgraded v{current} → v{version}"), true)),
+        Err(err) => Some((format!("auto-upgrade to v{version} failed: {err}"), false)),
     }
 }
 
-pub fn run() -> Result<()> {
+/// Perform an explicit update. Returns true only when the executable changed.
+pub fn run() -> Result<bool> {
     let current = env!("CARGO_PKG_VERSION");
     let target = target_key().ok_or_else(|| {
         anyhow!(
@@ -176,7 +176,7 @@ pub fn run() -> Result<()> {
         .ok_or_else(|| anyhow!("manifest has no version"))?;
     if latest == current {
         println!("Already up to date (v{current}).");
-        return Ok(());
+        return Ok(false);
     }
     // Never downgrade: a stale mirror or rolled-back manifest must not replace
     // a newer local build. (Unparseable versions fall through and install.)
@@ -184,7 +184,7 @@ pub fn run() -> Result<()> {
         && remote <= local
     {
         println!("Server offers v{latest}, which is not newer than v{current} — nothing to do.");
-        return Ok(());
+        return Ok(false);
     }
 
     let url = manifest
@@ -219,7 +219,7 @@ pub fn run() -> Result<()> {
     let exe = std::env::current_exe().context("cannot locate the running executable")?;
     replace_executable(&exe, &bytes)?;
     println!("Upgraded: v{current} → v{latest}");
-    Ok(())
+    Ok(true)
 }
 
 /// Parse "X.Y.Z" into a comparable triple; None when it isn't three numbers.

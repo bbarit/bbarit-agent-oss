@@ -784,7 +784,11 @@ fn handle_command(
         }
         "/extensions" => Ok(crate::extensions::format_extension_list(config)?),
         "/update" | "/selfupdate" => match crate::update::run() {
-            Ok(()) => Ok("Update check complete (see output above).".to_string()),
+            Ok(true) => Ok(
+                "Update installed. This open session is still the old process: run /quit now, then start bbarit-oss again to use the new version."
+                    .to_string(),
+            ),
+            Ok(false) => Ok("Already running the latest installed version.".to_string()),
             Err(err) => Err(err),
         },
         "/interop" => {

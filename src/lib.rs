@@ -52,12 +52,19 @@ use std::path::{Path, PathBuf};
 pub fn run() -> Result<()> {
     let cli = Cli::parse_args();
     if cli.upgrade {
-        return update::run();
+        update::run()?;
+        return Ok(());
     }
     // Opt-in in-place upgrade at startup (BBARIT_AUTO_UPGRADE=1). Default is a
     // non-blocking check that only surfaces a hint (see below).
-    if let Some(note) = update::maybe_auto_upgrade_at_startup() {
+    if let Some((note, upgraded)) = update::maybe_auto_upgrade_at_startup() {
         eprintln!("{note}");
+        if upgraded {
+            eprintln!(
+                "The old process will not continue. Start bbarit-oss again to run the new version."
+            );
+            return Ok(());
+        }
     }
     project::maybe_pick(&cli)?;
     let mut config = AppConfig::load(&cli)?;
