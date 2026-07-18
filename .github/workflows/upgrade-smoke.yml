@@ -1,0 +1,89 @@
+name: upgrade-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      old_version:
+        description: Version to upgrade from
+        required: true
+        default: 0.1.13
+      new_version:
+        description: Expected deployed version
+        required: true
+        default: 0.1.14
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Exercise install, explicit upgrade, and startup auto-upgrade
+        shell: bash
+        env:
+          OLD_VERSION: ${{ inputs.old_version }}
+          NEW_VERSION: ${{ inputs.new_version }}
+          TARGET: ${{ matrix.target }}
+          BASE_URL: https://bbarit.com/agent
+        run: |
+          set -euo pipefail
+          mkdir -p explicit auto install
+          curl -fsSL "$BASE_URL/dist/$OLD_VERSION/bbarit-oss-$TARGET" -o explicit/bbarit-oss
+          chmod +x explicit/bbarit-oss
+          explicit/bbarit-oss --version | grep -F "$OLD_VERSION"
+          BBARIT_UPDATE_BASE="$BASE_URL" explicit/bbarit-oss --upgrade
+          explicit/bbarit-oss --version | grep -F "$NEW_VERSION"
+          BBARIT_UPDATE_BASE="$BASE_URL" explicit/bbarit-oss --upgrade | grep -F "Already up to date"
+
+          BBARIT_INSTALL_DIR="$PWD/install" BBARIT_UPDATE_BASE="$BASE_URL" \
+            sh -c "$(curl -fsSL "$BASE_URL/install.sh")"
+          install/bbarit-oss --version | grep -F "$NEW_VERSION"
+
+          curl -fsSL "$BASE_URL/dist/$OLD_VERSION/bbarit-oss-$TARGET" -o auto/bbarit-oss
+          chmod +x auto/bbarit-oss
+          BBARIT_UPDATE_BASE="$BASE_URL" BBARIT_AUTO_UPGRADE=1 \
+            auto/bbarit-oss --list-providers --no-pick 2>&1 | tee auto/startup.log
+          grep -F "auto-upgraded v$OLD_VERSION → v$NEW_VERSION" auto/startup.log
+          auto/bbarit-oss --version | grep -F "$NEW_VERSION"
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Exercise install, explicit upgrade, and startup auto-upgrade
+        shell: pwsh
+        env:
+          OLD_VERSION: ${{ inputs.old_version }}
+          NEW_VERSION: ${{ inputs.new_version }}
+          BASE_URL: https://bbarit.com/agent
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force explicit, auto, install | Out-Null
+          $oldUrl = "$env:BASE_URL/dist/$env:OLD_VERSION/bbarit-oss-windows-x64.exe"
+
+          Invoke-WebRequest -UseBasicParsing -Uri $oldUrl -OutFile explicit/bbarit-oss.exe
+          (& ./explicit/bbarit-oss.exe --version) | Select-String -SimpleMatch $env:OLD_VERSION
+          $env:BBARIT_UPDATE_BASE = $env:BASE_URL
+          & ./explicit/bbarit-oss.exe --upgrade
+          (& ./explicit/bbarit-oss.exe --version) | Select-String -SimpleMatch $env:NEW_VERSION
+          (& ./explicit/bbarit-oss.exe --upgrade) | Select-String -SimpleMatch "Already up to date"
+
+          $env:BBARIT_INSTALL_DIR = (Resolve-Path install).Path
+          Invoke-WebRequest -UseBasicParsing -Uri "$env:BASE_URL/install.ps1" -OutFile install.ps1
+          & ./install.ps1
+          (& ./install/bbarit-oss.exe --version) | Select-String -SimpleMatch $env:NEW_VERSION
+
+          Invoke-WebRequest -UseBasicParsing -Uri $oldUrl -OutFile auto/bbarit-oss.exe
+          $env:BBARIT_AUTO_UPGRADE = "1"
+          (& ./auto/bbarit-oss.exe --list-providers --no-pick 2>&1) | Tee-Object auto/startup.log
+          Get-Content auto/startup.log | Select-String -SimpleMatch "auto-upgraded v$env:OLD_VERSION → v$env:NEW_VERSION"
+          Remove-Item Env:BBARIT_AUTO_UPGRADE
+          (& ./auto/bbarit-oss.exe --version) | Select-String -SimpleMatch $env:NEW_VERSION
