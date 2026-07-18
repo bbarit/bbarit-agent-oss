@@ -11,14 +11,30 @@ use crate::providers::{Model, Registry, ThinkingLevel};
 use crate::session::{Message, Role, SessionStore, ToolCallRecord};
 use crate::tools;
 
-// The agent loop runs until a natural stop (an assistant turn with no tool
-// calls); it has no fixed iteration cap. This port has no abort path yet, so we
-// keep a high safety backstop to prevent a pathological model from looping
-// forever, and on reaching it we return the latest output gracefully rather
-// than erroring out mid-task.
-const MAX_AGENT_TOOL_TURNS: usize = 32;
-const MAX_TOOL_CALLS_PER_TURN: usize = 24;
+// Natural completion remains the primary exit. The segment boundary is only a
+// progress checkpoint; the hard limit protects against pathological loops.
+const AGENT_TOOL_TURN_SEGMENT: usize = 32;
+const MAX_AGENT_TOOL_TURNS: usize = 128;
+const MAX_TOOL_CALLS_PER_TURN: usize = 128;
 const MAX_EMPTY_RESPONSE_RECOVERIES: usize = 2;
+
+fn should_auto_continue_agent_turn(completed_turns: usize) -> bool {
+    completed_turns > 0
+        && completed_turns < MAX_AGENT_TOOL_TURNS
+        && completed_turns.is_multiple_of(AGENT_TOOL_TURN_SEGMENT)
+}
+
+fn agent_turn_limit_message() -> String {
+    format!(
+        "(stopped at the hard safety limit after {MAX_AGENT_TOOL_TURNS} consecutive tool turns without a final answer. The task may be incomplete.)"
+    )
+}
+
+fn persist_agent_turn_limit(store: &mut SessionStore, model_ref: &str) -> Result<String> {
+    let message = agent_turn_limit_message();
+    store.push_assistant_with_usage(message.clone(), Some(model_ref.to_string()), None)?;
+    Ok(message)
+}
 
 fn tool_call_budget_exhausted(tool_calls: usize) -> bool {
     tool_calls > MAX_TOOL_CALLS_PER_TURN
@@ -2874,6 +2890,11 @@ fn run_agent_loop(
     let mut context_mark: Option<String> = None;
     let mut rewind_report: Option<String> = None;
     for turn_index in 0..MAX_AGENT_TOOL_TURNS {
+        if should_auto_continue_agent_turn(turn_index) {
+            crate::llm::emit_activity(&format!(
+                "\n⚙ continuing automatically after {turn_index} tool turns\n"
+            ));
+        }
         // Cooperative cancellation: stop before starting another turn when the
         // UI requested it (the streaming reader also bails mid-response on Esc).
         if cancel_requested() {
@@ -3672,8 +3693,9 @@ fn run_agent_loop(
         }
     }
 
-    // Safety backstop reached (see MAX_AGENT_TOOL_TURNS): return the latest
-    // assistant text instead of failing the whole turn.
+    // The hard safety backstop is the only turn-limit exit. Segment boundaries
+    // above continue automatically without storing a synthetic assistant turn.
+    let limit_message = persist_agent_turn_limit(store, &model_ref)?;
     push_hook_note(
         &mut hook_notes,
         extension_hook_notes(
@@ -3685,14 +3707,7 @@ fn run_agent_loop(
             }),
         )?,
     );
-    let last_text = store
-        .messages()
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::Assistant)
-        .map(|message| message.content.clone())
-        .unwrap_or_default();
-    Ok(join_hook_notes(hook_notes.join("\n"), last_text))
+    Ok(join_hook_notes(hook_notes.join("\n"), limit_message))
 }
 
 fn push_hook_note(notes: &mut Vec<String>, note: String) {
@@ -7568,13 +7583,31 @@ mod tests {
 
     #[test]
     fn token_safety_limits_have_exact_boundaries() {
-        assert_eq!(MAX_AGENT_TOOL_TURNS, 32);
-        assert_eq!((0..MAX_AGENT_TOOL_TURNS).count(), 32);
+        assert_eq!(AGENT_TOOL_TURN_SEGMENT, 32);
+        assert_eq!(MAX_AGENT_TOOL_TURNS, 128);
+        assert_eq!((0..MAX_AGENT_TOOL_TURNS).count(), 128);
+        assert!(!should_auto_continue_agent_turn(31));
+        assert!(should_auto_continue_agent_turn(32));
+        assert!(should_auto_continue_agent_turn(64));
+        assert!(should_auto_continue_agent_turn(96));
+        assert!(!should_auto_continue_agent_turn(128));
+        let turn_limit = agent_turn_limit_message();
+        assert!(!turn_limit.trim().is_empty());
+        assert!(turn_limit.contains("128 consecutive tool turns"));
+        assert!(turn_limit.contains("hard safety limit"));
 
-        assert_eq!(MAX_TOOL_CALLS_PER_TURN, 24);
-        assert!(!tool_call_budget_exhausted(23));
-        assert!(!tool_call_budget_exhausted(24));
-        assert!(tool_call_budget_exhausted(25));
+        let config = read_only_test_config();
+        let mut store = SessionStore::new_memory(&config, None).unwrap();
+        let returned = persist_agent_turn_limit(&mut store, "test/model").unwrap();
+        let stored = store.messages().last().unwrap();
+        assert_eq!(stored.role, Role::Assistant);
+        assert_eq!(stored.content, returned);
+        assert!(!stored.content.trim().is_empty());
+
+        assert_eq!(MAX_TOOL_CALLS_PER_TURN, 128);
+        assert!(!tool_call_budget_exhausted(127));
+        assert!(!tool_call_budget_exhausted(128));
+        assert!(tool_call_budget_exhausted(129));
 
         assert!(should_recover_empty_response("  \n", 0, 0));
         assert!(!should_recover_empty_response("done", 0, 0));
