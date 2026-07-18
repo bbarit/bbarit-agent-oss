@@ -1115,13 +1115,17 @@ pub fn read_file(path: &Path, offset: Option<usize>, limit: Option<usize>) -> Re
     let mut output = crate::hashline::render(&window, start + 1);
     if end < lines.len() {
         output.push_str(&format!(
-            "\n\n[{} more lines in file. Use offset={} to continue.]",
+            "\n\n[Output window ended normally: {} more lines remain. Continue with read \
+             offset={}. This is not an error.]",
             lines.len() - end,
             end + 1
         ));
     }
     if truncated {
-        output.push_str("\n[truncated by byte limit]");
+        output.push_str(
+            "\n[Output capped by the byte safety limit. Continue with the offset above instead \
+             of retrying the same read. This is not an error.]",
+        );
     }
     // Unresolved merge conflicts bite every later edit — surface them at read
     // time, register each block, and hand the model a direct resolution path.
@@ -1716,14 +1720,19 @@ fn grep_via_ripgrep(
         Some(0) => {
             let text = String::from_utf8_lossy(&output.stdout);
             let mut lines: Vec<&str> = text.lines().collect();
-            let truncated = lines.len() > options.limit;
+            // `rg --max-count` is applied per file, so an exact `limit`-sized
+            // stdout can still mean more matches were suppressed in that file.
+            // Match the native walker's conservative boundary and tell the
+            // model how to continue instead of silently looking complete.
+            let truncated = lines.len() >= options.limit;
             if truncated {
                 lines.truncate(options.limit);
             }
             let mut result = lines.join("\n");
             if truncated {
                 result.push_str(&format!(
-                    "\n\n[{} matches limit reached. Refine pattern or increase limit.]",
+                    "\n\n[Search result limit {} reached normally. This is not an error; refine the \
+                     pattern/path/glob or increase limit if more matches are needed.]",
                     options.limit
                 ));
             }
@@ -1761,7 +1770,8 @@ fn grep(pattern: &str, root: &Path, options: GrepOptions<'_>) -> Result<String> 
         let mut output = matches.join("\n");
         if matches.len() >= options.limit {
             output.push_str(&format!(
-                "\n\n[{} matches limit reached. Refine pattern or increase limit.]",
+                "\n\n[Search result limit {} reached normally. This is not an error; refine the \
+                 pattern/path/glob or increase limit if more matches are needed.]",
                 options.limit
             ));
         }
@@ -1885,7 +1895,8 @@ fn find_files(pattern: &str, root: &Path, limit: usize) -> Result<String> {
         let mut output = matches.join("\n");
         if matches.len() >= limit {
             output.push_str(&format!(
-                "\n\n[{limit} results limit reached. Refine pattern or increase limit.]"
+                "\n\n[File result limit {limit} reached normally. This is not an error; refine the \
+                 pattern/path or increase limit if more results are needed.]"
             ));
         }
         Ok(output)
@@ -5344,6 +5355,37 @@ mod tests {
                 crate::hashline::line_hash("beta")
             )
         );
+    }
+
+    #[test]
+    fn read_and_search_limit_notices_are_actionable_non_errors() {
+        let dir = fixture_dir("limit-notices");
+        fs::write(dir.join("sample.txt"), "alpha\nalpha\nomega\n").unwrap();
+        fs::write(dir.join("a.rs"), "alpha\n").unwrap();
+        fs::write(dir.join("b.rs"), "alpha\n").unwrap();
+
+        let read = execute_tool(&dir, "read", &json!({"path": "sample.txt", "limit": 1})).unwrap();
+        assert!(read.contains("Continue with read offset=2"), "{read}");
+        assert!(read.contains("This is not an error"), "{read}");
+
+        let grep = execute_tool(
+            &dir,
+            "grep",
+            &json!({"pattern": "alpha", "path": "sample.txt", "limit": 1}),
+        )
+        .unwrap();
+        assert!(
+            grep.contains("Search result limit 1 reached normally"),
+            "{grep}"
+        );
+        assert!(grep.contains("This is not an error"), "{grep}");
+
+        let find = execute_tool(&dir, "find", &json!({"pattern": "*.rs", "limit": 1})).unwrap();
+        assert!(
+            find.contains("File result limit 1 reached normally"),
+            "{find}"
+        );
+        assert!(find.contains("This is not an error"), "{find}");
     }
 
     #[test]

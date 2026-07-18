@@ -18,9 +18,20 @@ use crate::tools;
 // than erroring out mid-task.
 const MAX_AGENT_TOOL_TURNS: usize = 32;
 const MAX_TOOL_CALLS_PER_TURN: usize = 24;
+const MAX_EMPTY_RESPONSE_RECOVERIES: usize = 2;
 
 fn tool_call_budget_exhausted(tool_calls: usize) -> bool {
     tool_calls > MAX_TOOL_CALLS_PER_TURN
+}
+
+fn should_recover_empty_response(
+    text: &str,
+    tool_call_count: usize,
+    recoveries_used: usize,
+) -> bool {
+    text.trim().is_empty()
+        && tool_call_count == 0
+        && recoveries_used < MAX_EMPTY_RESPONSE_RECOVERIES
 }
 
 // Compaction prompts.
@@ -2848,6 +2859,7 @@ fn run_agent_loop(
     const MAX_AUTO_CONTINUES: usize = 3;
     let mut auto_continue_used: usize = 0;
     let mut transport_recovery_used: usize = 0;
+    let mut empty_response_recovery_used: usize = 0;
     // Stale-list guard: only a todo list the model touched THIS user turn can
     // trigger auto-continue — leftovers from an earlier task must not hijack
     // an unrelated question.
@@ -2976,6 +2988,41 @@ fn run_agent_loop(
                 Vec::new(),
             )?;
             continue;
+        }
+        // Some providers occasionally end a streamed turn with neither text nor
+        // tool calls after a large read/search result. Treat that as an
+        // incomplete response, not a valid blank final answer. Persist a small
+        // non-empty marker so provider role alternation stays valid, then nudge
+        // the same user turn to continue from the tool result.
+        if should_recover_empty_response(
+            &response.text,
+            response.tool_calls.len(),
+            empty_response_recovery_used,
+        ) {
+            empty_response_recovery_used += 1;
+            store.push_assistant_with_usage(
+                "[Provider returned an empty response; recovering automatically.]",
+                Some(model_ref.clone()),
+                response.usage.clone(),
+            )?;
+            crate::llm::emit_activity(&format!(
+                "\n⚙ empty response recovery: continuing automatically ({empty_response_recovery_used}/{MAX_EMPTY_RESPONSE_RECOVERIES})\n"
+            ));
+            store.push_user_with_images(
+                "[Automatic empty-response recovery] Continue the original task from the tool \
+                 results above. A read/search limit notice is a normal safety boundary, not an \
+                 error: use the supplied read offset, or refine/increase the search limit as \
+                 needed. Do not stop until you provide a non-empty final answer.",
+                Vec::new(),
+            )?;
+            continue;
+        }
+        if response.tool_calls.is_empty() && response.text.trim().is_empty() {
+            response.text = format!(
+                "(stopped: the provider returned an empty response after \
+                 {MAX_EMPTY_RESPONSE_RECOVERIES} automatic recovery attempts. Retry the request \
+                 or switch provider/model.)"
+            );
         }
         // Content-loop gate: a response caught rewriting the same chunk over
         // and over ends the turn immediately with an explicit note.
@@ -7524,6 +7571,15 @@ mod tests {
         assert!(!tool_call_budget_exhausted(23));
         assert!(!tool_call_budget_exhausted(24));
         assert!(tool_call_budget_exhausted(25));
+
+        assert!(should_recover_empty_response("  \n", 0, 0));
+        assert!(!should_recover_empty_response("done", 0, 0));
+        assert!(!should_recover_empty_response("", 1, 0));
+        assert!(!should_recover_empty_response(
+            "",
+            0,
+            MAX_EMPTY_RESPONSE_RECOVERIES
+        ));
 
         assert_eq!(DEFAULT_CONTEXT_BUDGET_TOKENS, 80_000);
         let reserve = crate::config::DEFAULT_COMPACTION_RESERVE_TOKENS;
