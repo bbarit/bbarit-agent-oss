@@ -249,10 +249,22 @@ fn extract_image_attachments(input: &str, cwd: &std::path::Path) -> (String, Vec
     }
 }
 
-/// Load an image file (by image extension) as a base64 data URL, or None.
+/// Load an image (by image extension) as a base64 data URL, or None.
+/// Accepts a filesystem path (absolute, `~/`-prefixed, or cwd-relative) or an
+/// http(s) URL — screenshots pasted as `@~/Pictures/…` and image links pasted
+/// as `@https://…` were both silently dropped before, leaving the model with a
+/// dead path string it then burned turns trying to `read`.
 fn load_image_data_url(path: &str, cwd: &std::path::Path) -> Option<String> {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        // Extension check ignores the query/fragment (`…/img.png?w=800`).
+        let without_query = path.split(['?', '#']).next().unwrap_or(path);
+        let ext_mime = image_mime(without_query)?;
+        return fetch_image_data_url(path, ext_mime);
+    }
     let ext_mime = image_mime(path)?;
-    let full = if std::path::Path::new(path).is_absolute() {
+    let full = if let Some(rest) = path.strip_prefix("~/") {
+        dirs_next::home_dir()?.join(rest)
+    } else if std::path::Path::new(path).is_absolute() {
         std::path::PathBuf::from(path)
     } else {
         cwd.join(path)
@@ -264,6 +276,33 @@ fn load_image_data_url(path: &str, cwd: &std::path::Path) -> Option<String> {
     let mime = sniff_image_mime(&bytes).unwrap_or(ext_mime);
     if mime == "image/bmp" {
         return None; // providers accept only jpeg/png/gif/webp
+    }
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:{mime};base64,{data}"))
+}
+
+/// Download an image URL into a base64 data URL. Bounded (20s, 15MB) so a bad
+/// link degrades into "not an attachment" instead of stalling the turn.
+fn fetch_image_data_url(url: &str, ext_mime: &'static str) -> Option<String> {
+    const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .ok()?
+        .get(url)
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mime = sniff_image_mime(&bytes).unwrap_or(ext_mime);
+    if mime == "image/bmp" {
+        return None;
     }
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -7390,6 +7429,26 @@ mod tests {
         assert!(model_cost_for_ref(&registry, "anthropic/claude-sonnet-4-5:high").is_some());
         // Bedrock ids contain a colon that must NOT be treated as a thinking level.
         assert!(model_cost_for_ref(&registry, "amazon-bedrock/amazon.nova-pro-v1:0").is_some());
+    }
+
+    /// `@~/…` screenshot references must expand to the home directory —
+    /// unexpanded tildes silently dropped the attachment and the model then
+    /// burned tool turns trying to `read` a path that "didn't exist".
+    #[test]
+    fn extract_image_expands_tilde_to_home() {
+        let home = dirs_next::home_dir().expect("home dir");
+        let name = format!(".bbarit-test-tilde-{}.png", uuid::Uuid::new_v4());
+        let file = home.join(&name);
+        std::fs::write(&file, b"\x89PNG\r\n\x1a\nfake").unwrap();
+
+        let cwd = std::env::temp_dir();
+        let input = format!("@~/{name} what is this?");
+        let (text, images) = extract_image_attachments(&input, &cwd);
+        let _ = std::fs::remove_file(&file);
+
+        assert_eq!(images.len(), 1, "tilde path must attach");
+        assert!(images[0].starts_with("data:image/png;base64,"));
+        assert_eq!(text, "what is this?");
     }
 
     #[test]

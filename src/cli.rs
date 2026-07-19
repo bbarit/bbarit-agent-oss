@@ -202,7 +202,14 @@ impl Cli {
             }
         }
         for input in &self.inputs {
-            if let Some(path) = input.strip_prefix('@') {
+            if let Some(rest) = input.strip_prefix('@') {
+                // Only the first whitespace token is the @file reference — a
+                // single quoted argument like "@shot.png what is this?" used to
+                // be read as one giant filename and fail the whole run.
+                let (path, trailing) = match rest.split_once(char::is_whitespace) {
+                    Some((path, trailing)) => (path, trailing.trim()),
+                    None => (rest, ""),
+                };
                 // Images are attached as vision input downstream, not inlined as
                 // text — keep the token so the agent can load the file.
                 let lower = path.to_lowercase();
@@ -211,11 +218,14 @@ impl Cli {
                     .any(|ext| lower.ends_with(ext))
                 {
                     parts.push(format!("@{path}"));
-                    continue;
+                } else {
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("failed to read @{path}"))?;
+                    parts.push(format!("--- file: {path} ---\n{text}"));
                 }
-                let text = std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read @{path}"))?;
-                parts.push(format!("--- file: {path} ---\n{text}"));
+                if !trailing.is_empty() {
+                    parts.push(trailing.to_string());
+                }
             }
         }
         let messages = self
@@ -228,5 +238,22 @@ impl Cli {
             parts.push(messages.join(" "));
         }
         Ok((!parts.is_empty()).then(|| parts.join("\n\n")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single quoted argument "@shot.png what is this?" must attach the image
+    /// token and keep the question — it used to be read as one giant filename
+    /// and fail the whole headless run.
+    #[test]
+    fn at_image_argument_with_trailing_prompt_splits_cleanly() {
+        let cli = Cli::parse_from(["bbarit-oss", "-p", "@shot.png what solid color is this?"]);
+        let message = cli.initial_message().unwrap().unwrap();
+        assert!(message.contains("@shot.png"));
+        assert!(message.contains("what solid color is this?"));
+        assert!(!message.contains("@shot.png what"));
     }
 }
