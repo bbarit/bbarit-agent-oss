@@ -4031,6 +4031,14 @@ pub fn metadata_for(model: &Model) -> ModelMetadata {
                 force_adaptive_thinking: None,
             },
         },
+        ("openrouter", "x-ai/grok-4.5") => ModelMetadata {
+            thinking_level_map: &[],
+            compat: ModelCompat {
+                supports_reasoning_effort: None,
+                thinking_format: Some("openrouter"),
+                force_adaptive_thinking: None,
+            },
+        },
         ("openrouter", "x-ai/grok-build-0.1") => ModelMetadata {
             thinking_level_map: &[],
             compat: ModelCompat {
@@ -4591,10 +4599,32 @@ pub fn metadata_for(model: &Model) -> ModelMetadata {
                 force_adaptive_thinking: None,
             },
         },
+        ("xai", "grok-4.20-multi-agent-0309") => ModelMetadata {
+            thinking_level_map: &[],
+            compat: ModelCompat {
+                supports_reasoning_effort: Some(false),
+                thinking_format: None,
+                force_adaptive_thinking: None,
+            },
+        },
         ("xai", "grok-4.3") => ModelMetadata {
             thinking_level_map: &[],
             compat: ModelCompat {
                 supports_reasoning_effort: Some(false),
+                thinking_format: None,
+                force_adaptive_thinking: None,
+            },
+        },
+        ("xai", "grok-4.5") => ModelMetadata {
+            thinking_level_map: &[
+                (ThinkingLevel::Minimal, Some("low")),
+                (ThinkingLevel::Low, Some("low")),
+                (ThinkingLevel::Medium, Some("medium")),
+                (ThinkingLevel::High, Some("high")),
+                (ThinkingLevel::XHigh, Some("high")),
+            ],
+            compat: ModelCompat {
+                supports_reasoning_effort: Some(true),
                 thinking_format: None,
                 force_adaptive_thinking: None,
             },
