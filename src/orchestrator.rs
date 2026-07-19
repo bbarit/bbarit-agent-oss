@@ -206,7 +206,13 @@ pub fn run_team(
                 let provider = provider.map(str::to_string);
                 let model = model.map(str::to_string);
                 let persona = persona.map(str::to_string);
+                // Propagate the turn epoch so a hard abort (double-Esc) also
+                // reads as cancelled inside subagent threads.
+                let epoch = crate::commands::current_worker_epoch();
                 thread::spawn(move || {
+                    if let Some(epoch) = epoch {
+                        crate::commands::enter_worker_epoch(epoch);
+                    }
                     (
                         index,
                         run_subagent(
@@ -277,7 +283,11 @@ pub fn run_tasks(config: &AppConfig, approve: bool, tasks: &[String]) -> String 
                 let model = config.model.clone();
                 let cwd = config.cwd.clone();
                 let task = tasks[index].clone();
+                let epoch = crate::commands::current_worker_epoch();
                 thread::spawn(move || {
+                    if let Some(epoch) = epoch {
+                        crate::commands::enter_worker_epoch(epoch);
+                    }
                     let text = run_subagent(
                         &cwd,
                         &task,

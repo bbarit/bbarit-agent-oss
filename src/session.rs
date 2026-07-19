@@ -1168,6 +1168,17 @@ impl SessionStore {
         })
     }
 
+    /// Session file backing this store, if any (None for in-memory sessions).
+    /// The TUI uses it to reload the session after a hard abort hands the
+    /// original store to an abandoned worker thread.
+    pub(crate) fn file_path(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
+
+    pub(crate) fn reopen(path: PathBuf) -> Result<Self> {
+        Self::open_path(path)
+    }
+
     fn open_path(path: PathBuf) -> Result<Self> {
         let mut session = None;
         let mut messages = Vec::new();
@@ -1381,6 +1392,12 @@ impl SessionStore {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        // An abandoned worker (double-Esc hard abort) may still be unwinding.
+        // Its in-memory bookkeeping is harmless, but it must never write to the
+        // session file the UI has since reloaded and continued appending to.
+        if crate::commands::worker_abandoned() {
+            return Ok(());
+        }
         if !path.exists() || store_len(path) == 0 {
             self.append_header()?;
         }
@@ -2233,6 +2250,51 @@ fn html_escape(input: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// An abandoned worker (hard abort bumped the turn epoch) must never write
+    /// to the session file — the UI reloaded it and keeps appending there.
+    #[test]
+    fn abandoned_worker_does_not_write_session_file() {
+        let _serial = crate::commands::epoch_test_lock();
+        let dir = std::env::temp_dir().join(format!("bbarit-abandon-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let mut store = SessionStore {
+            session: Session {
+                id: "abandon-test".to_string(),
+                cwd: dir.clone(),
+                name: None,
+                current_model: None,
+                current_node: None,
+                created_at: now(),
+            },
+            messages: Vec::new(),
+            entries: Vec::new(),
+            path: Some(path.clone()),
+        };
+        store.push_user_with_images("first", Vec::new()).unwrap();
+        let len_before = fs::metadata(&path).unwrap().len();
+
+        let stale_epoch = crate::commands::current_turn_epoch();
+        crate::commands::abandon_current_turn();
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::commands::enter_worker_epoch(stale_epoch);
+                    store.push_user_with_images("from the orphan", Vec::new())
+                })
+                .join()
+                .unwrap()
+        });
+        result.unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            len_before,
+            "orphan writes must be dropped, not appended to the session file"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn pi_entry_types_round_trip() {

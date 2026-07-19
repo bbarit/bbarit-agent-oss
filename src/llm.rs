@@ -104,16 +104,36 @@ pub fn emit_activity(text: &str) {
 /// cancellation until it finally replies — the "Esc does nothing" bug. Here a
 /// dedicated thread does the blocking reads and hands bytes over a channel; our
 /// `read` polls that channel with a short timeout, so it wakes ~5×/s to check
-/// `cancel_requested()`. On cancel it returns `Interrupted`, which stops the SSE
-/// loop cleanly; dropping this reader closes the connection and ends the thread.
+/// `cancel_requested()`. On cancel it returns `ConnectionAborted`, which stops
+/// the SSE loop; dropping this reader closes the connection and ends the thread.
+/// It must NOT return `ErrorKind::Interrupted`: std's `read_line`/`read_until`
+/// treat Interrupted as "retry the read", which turned Esc during an active
+/// stream into a busy loop that only ended when the provider finished the
+/// response on its own.
 struct CancellableRead {
     rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     leftover: Vec<u8>,
     offset: usize,
+    idle_timeout: std::time::Duration,
 }
 
+/// A live provider stream is never silent this long (providers ping or emit
+/// deltas every few seconds). Zero bytes for this long means the connection
+/// stalled without closing (NAT drop, sleep/wake, dead proxy) — the read would
+/// otherwise block until the user notices and cancels by hand. Timing out turns
+/// the stall into a read error, which the SSE parsers treat as a dropped
+/// connection and the transport-recovery path reconnects from.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 impl CancellableRead {
-    fn new<R: std::io::Read + Send + 'static>(mut inner: R) -> Self {
+    fn new<R: std::io::Read + Send + 'static>(inner: R) -> Self {
+        Self::with_idle_timeout(inner, STREAM_IDLE_TIMEOUT)
+    }
+
+    fn with_idle_timeout<R: std::io::Read + Send + 'static>(
+        mut inner: R,
+        idle_timeout: std::time::Duration,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
@@ -136,6 +156,7 @@ impl CancellableRead {
             rx,
             leftover: Vec::new(),
             offset: 0,
+            idle_timeout,
         }
     }
 }
@@ -145,10 +166,11 @@ impl std::io::Read for CancellableRead {
         if self.offset >= self.leftover.len() {
             self.leftover.clear();
             self.offset = 0;
+            let wait_started = std::time::Instant::now();
             loop {
                 if crate::commands::cancel_requested() {
                     return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
+                        std::io::ErrorKind::ConnectionAborted,
                         "cancelled by user",
                     ));
                 }
@@ -158,7 +180,18 @@ impl std::io::Read for CancellableRead {
                         break;
                     }
                     Ok(Err(e)) => return Err(e),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if wait_started.elapsed() >= self.idle_timeout {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!(
+                                    "no bytes from provider for {}s — treating the connection as stalled",
+                                    self.idle_timeout.as_secs()
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
                 }
             }
@@ -5570,6 +5603,84 @@ fn finalize_tool_arguments(name: &str, partial: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Esc during an active stream must surface as a read ERROR through
+    /// BufReader::read_line. `ErrorKind::Interrupted` specifically must never
+    /// be used for cancellation: std's read_line/read_until silently retry on
+    /// Interrupted, which turned Esc into a busy loop that only ended when the
+    /// provider finished the whole response by itself.
+    #[test]
+    fn cancelled_stream_read_errors_instead_of_retrying_forever() {
+        use std::io::BufRead;
+
+        // First read yields one SSE line, then blocks "forever" (like a
+        // provider mid-response with no bytes on the wire).
+        struct StallAfterFirstRead(bool);
+        impl std::io::Read for StallAfterFirstRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    let data = b"data: {}\n";
+                    buf[..data.len()].copy_from_slice(data);
+                    return Ok(data.len());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+                Ok(0)
+            }
+        }
+
+        crate::commands::reset_cancel();
+        let mut reader = std::io::BufReader::new(CancellableRead::new(StallAfterFirstRead(false)));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("first line must arrive");
+        assert_eq!(line, "data: {}\n");
+
+        crate::commands::request_cancel();
+        let started = std::time::Instant::now();
+        let error = reader
+            .read_line(&mut String::new())
+            .expect_err("cancel must abort the blocked read");
+        crate::commands::reset_cancel();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cancel must abort promptly, not spin or wait for the stream"
+        );
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "Interrupted is retried by std::io and must not signal cancellation"
+        );
+    }
+
+    /// A silently stalled connection (no bytes, no close) must turn into a
+    /// TimedOut read error after the idle timeout instead of blocking forever.
+    #[test]
+    fn stalled_stream_times_out_as_read_error() {
+        use std::io::BufRead;
+
+        struct NeverReturns;
+        impl std::io::Read for NeverReturns {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+                Ok(0)
+            }
+        }
+
+        crate::commands::reset_cancel();
+        let mut reader = std::io::BufReader::new(CancellableRead::with_idle_timeout(
+            NeverReturns,
+            std::time::Duration::from_millis(250),
+        ));
+        let started = std::time::Instant::now();
+        let error = reader
+            .read_line(&mut String::new())
+            .expect_err("stalled stream must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "idle timeout must fire near its configured duration"
+        );
+    }
 
     fn test_tool(name: &str) -> ToolSpec {
         ToolSpec {

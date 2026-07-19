@@ -3596,19 +3596,35 @@ fn run_single_turn(
         .map(|mode| format!(" ⟪{mode}⟫"))
         .unwrap_or_default();
     app.working = true;
-    let worker_store: &mut SessionStore = &mut *store;
-    let outcome: Result<String> = std::thread::scope(|scope| {
-        let worker = scope.spawn(move || {
-            // STREAM_SINK is thread-local; install it on THIS worker thread so
-            // streamed tokens and live tool activity actually reach the UI.
-            crate::llm::set_stream_sink(Some(Box::new(move |chunk: &str| {
-                let _ = tx.send(chunk.to_string());
-            })));
-            let result = handle_input(worker_store, registry, config, input);
-            crate::llm::set_stream_sink(None);
-            result
-        });
-        loop {
+    // The worker OWNS the store for the duration of the turn (moved in, sent
+    // back on completion). This is what makes double-Esc hard abort possible:
+    // a scoped borrow would force joining the worker, so a step stuck in a
+    // blocking call that ignores the cancel flag could hold the UI hostage.
+    // On hard abort the UI abandons the worker, bumps the turn epoch (the
+    // orphan then reads cancel_requested()==true forever and stops writing the
+    // session file), and reloads the session from disk to keep going.
+    let epoch = crate::commands::current_turn_epoch();
+    let session_path = store.file_path();
+    let (done_tx, done_rx) = mpsc::channel::<(SessionStore, Result<String>)>();
+    let placeholder =
+        SessionStore::new_memory(config, None).expect("in-memory placeholder store");
+    let owned_store = std::mem::replace(&mut *store, placeholder);
+    let worker_registry = registry.clone();
+    let worker_config = config.clone();
+    let worker_input = input.to_string();
+    std::thread::spawn(move || {
+        crate::commands::enter_worker_epoch(epoch);
+        // STREAM_SINK is thread-local; install it on THIS worker thread so
+        // streamed tokens and live tool activity actually reach the UI.
+        crate::llm::set_stream_sink(Some(Box::new(move |chunk: &str| {
+            let _ = tx.send(chunk.to_string());
+        })));
+        let mut worker_store = owned_store;
+        let result = handle_input(&mut worker_store, &worker_registry, &worker_config, &worker_input);
+        crate::llm::set_stream_sink(None);
+        let _ = done_tx.send((worker_store, result));
+    });
+    let outcome: Result<String> = 'turn: loop {
             while let Ok(chunk) = rx.try_recv() {
                 partial.push_str(&chunk);
                 // Don't force follow here: if the user scrolled up to read
@@ -3634,7 +3650,7 @@ fn run_single_turn(
                 })
                 .unwrap_or_default();
             app.working_text = if cancelling {
-                format!(" ✗ cancelling… stops after the current step  {bar}")
+                format!(" ✗ cancelling… stops after the current step  {bar}   (Esc again to force-stop)")
             } else {
                 format!(
                     " {spin} working{mode_badge}{dots}  {bar}  {}s{activity}   (Esc to cancel)",
@@ -3653,13 +3669,25 @@ fn run_single_turn(
             };
             let _ = terminal.draw(|frame| render(frame, app, render_partial));
             tick += 1;
-            if worker.is_finished() {
-                while let Ok(chunk) = rx.try_recv() {
-                    partial.push_str(&chunk);
+            match done_rx.try_recv() {
+                Ok((worker_store, result)) => {
+                    while let Ok(chunk) = rx.try_recv() {
+                        partial.push_str(&chunk);
+                    }
+                    *store = worker_store;
+                    break 'turn result;
                 }
-                return worker
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("turn thread panicked")));
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The worker panicked and its store went down with it —
+                    // recover the session from disk so the TUI can continue.
+                    if let Some(path) = &session_path
+                        && let Ok(reloaded) = SessionStore::reopen(path.clone())
+                    {
+                        *store = reloaded;
+                    }
+                    break 'turn Err(anyhow::anyhow!("turn thread panicked"));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
             // Accept input while the turn runs: Esc cancels (after the current
             // call), Enter queues a follow-up, paste/keys edit the input line.
@@ -3682,6 +3710,24 @@ fn run_single_turn(
                         }
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             if is_turn_cancel_key(key.code, key.modifiers) {
+                                if cancelling {
+                                    // Second Esc while already cancelling: hard
+                                    // abort. Stop waiting for the worker, bump
+                                    // the epoch (the orphan sees itself as
+                                    // cancelled forever and stops writing the
+                                    // session file), reload the session from
+                                    // disk, and hand the UI back immediately.
+                                    crate::commands::abandon_current_turn();
+                                    if let Some(path) = &session_path
+                                        && let Ok(reloaded) = SessionStore::reopen(path.clone())
+                                    {
+                                        *store = reloaded;
+                                    }
+                                    break 'turn Ok(
+                                        "(force-stopped — abandoned the stalled step; the session continues)"
+                                            .to_string(),
+                                    );
+                                }
                                 crate::commands::request_cancel();
                                 cancelling = true;
                                 continue;
@@ -3745,8 +3791,7 @@ fn run_single_turn(
                     }
                 }
             }
-        }
-    });
+        };
 
     match outcome {
         Ok(output) => {

@@ -2267,6 +2267,56 @@ pub fn default_model_label(
 
 static AGENT_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Turn epoch for hard abort (double-Esc). The UI accepts results only from the
+/// current epoch; abandoning a turn bumps it, so an orphaned worker thread —
+/// stuck in a step that ignores the cooperative flag — sees itself as
+/// permanently cancelled the moment it unblocks, even after later turns call
+/// `reset_cancel`. Workers record their epoch in a thread-local at spawn.
+static TURN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static WORKER_EPOCH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn current_turn_epoch() -> u64 {
+    TURN_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mark the calling thread as a turn worker of the given epoch. Threads a
+/// worker spawns must propagate this (see `current_worker_epoch`), or they
+/// only observe the plain cancel flag.
+pub fn enter_worker_epoch(epoch: u64) {
+    WORKER_EPOCH.with(|slot| slot.set(Some(epoch)));
+}
+
+pub fn current_worker_epoch() -> Option<u64> {
+    WORKER_EPOCH.with(std::cell::Cell::get)
+}
+
+/// Hard abort (double-Esc): stop accepting anything from the running turn.
+/// The worker is not joined — it unwinds on its own at the next blocking-point
+/// return and sees `worker_abandoned()` from then on.
+pub fn abandon_current_turn() {
+    TURN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True on a worker thread whose turn was hard-aborted. Checked by
+/// `cancel_requested` (so every cooperative checkpoint sees it) and by the
+/// session store (so an orphan never writes to the session file the UI has
+/// since reloaded and continued).
+pub fn worker_abandoned() -> bool {
+    WORKER_EPOCH
+        .with(std::cell::Cell::get)
+        .is_some_and(|epoch| epoch != TURN_EPOCH.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Tests that bump the global TURN_EPOCH must not interleave.
+#[cfg(test)]
+pub(crate) fn epoch_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Request cooperative cancellation of the running agent loop. The loop stops
 /// before the next turn (an in-flight blocking call still completes).
 pub fn request_cancel() {
@@ -2279,7 +2329,7 @@ pub fn reset_cancel() {
 }
 
 pub fn cancel_requested() -> bool {
-    AGENT_CANCEL.load(std::sync::atomic::Ordering::Relaxed)
+    worker_abandoned() || AGENT_CANCEL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static SUBAGENT_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -6809,6 +6859,44 @@ fn truncate(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hard abort (epoch bump) must read as permanent cancellation inside the
+    /// abandoned worker thread — surviving even a later `reset_cancel` from the
+    /// next turn — while leaving non-worker threads (the UI) unaffected.
+    #[test]
+    fn abandoned_worker_reads_cancelled_forever_but_ui_thread_does_not() {
+        let _serial = epoch_test_lock();
+        reset_cancel();
+        let epoch = current_turn_epoch();
+        let (worker_ready_tx, worker_ready_rx) = std::sync::mpsc::channel();
+        let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            enter_worker_epoch(epoch);
+            let before_abort = cancel_requested();
+            worker_ready_tx.send(()).unwrap();
+            abandoned_rx.recv().unwrap();
+            let after_abort = cancel_requested();
+            let after_reset = {
+                // A later turn resetting the flag must NOT revive the orphan.
+                reset_cancel();
+                cancel_requested()
+            };
+            (before_abort, after_abort, after_reset)
+        });
+
+        worker_ready_rx.recv().unwrap();
+        abandon_current_turn();
+        abandoned_tx.send(()).unwrap();
+        let (before_abort, after_abort, after_reset) = worker.join().unwrap();
+
+        assert!(!before_abort, "worker must start uncancelled");
+        assert!(after_abort, "epoch bump must cancel the abandoned worker");
+        assert!(after_reset, "reset_cancel must not revive an abandoned worker");
+        assert!(
+            !cancel_requested(),
+            "the UI thread (no worker epoch) must be unaffected by the abort"
+        );
+    }
 
     fn message_with_todo_call(items: serde_json::Value) -> Message {
         Message {
