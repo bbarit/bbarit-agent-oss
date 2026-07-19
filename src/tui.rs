@@ -3606,8 +3606,7 @@ fn run_single_turn(
     let epoch = crate::commands::current_turn_epoch();
     let session_path = store.file_path();
     let (done_tx, done_rx) = mpsc::channel::<(SessionStore, Result<String>)>();
-    let placeholder =
-        SessionStore::new_memory(config, None).expect("in-memory placeholder store");
+    let placeholder = SessionStore::new_memory(config, None).expect("in-memory placeholder store");
     let owned_store = std::mem::replace(&mut *store, placeholder);
     let worker_registry = registry.clone();
     let worker_config = config.clone();
@@ -3620,178 +3619,183 @@ fn run_single_turn(
             let _ = tx.send(chunk.to_string());
         })));
         let mut worker_store = owned_store;
-        let result = handle_input(&mut worker_store, &worker_registry, &worker_config, &worker_input);
+        let result = handle_input(
+            &mut worker_store,
+            &worker_registry,
+            &worker_config,
+            &worker_input,
+        );
         crate::llm::set_stream_sink(None);
         let _ = done_tx.send((worker_store, result));
     });
     let outcome: Result<String> = 'turn: loop {
-            while let Ok(chunk) = rx.try_recv() {
-                partial.push_str(&chunk);
-                // Don't force follow here: if the user scrolled up to read
-                // earlier output while the agent streams, stay where they are
-                // (follow resumes when they scroll back to the bottom).
-            }
-            // Always-visible animated working indicator in the top bar, with the
-            // current activity (last ⚙/✓/✗ line) so you always see what it's doing.
-            let spin = SPINNER[tick % SPINNER.len()];
-            let bar = working_bar(tick);
-            let dots = ".".repeat(1 + (tick / 2) % 3);
-            let activity = partial
-                .lines()
-                .rev()
-                .find(|line| {
-                    let t = line.trim_start();
-                    t.starts_with('⚙') || t.starts_with('✓') || t.starts_with('✗')
-                })
-                .map(|line| {
-                    let line = line.trim();
-                    let preview: String = line.chars().take(48).collect();
-                    format!("  ·  {preview}")
-                })
-                .unwrap_or_default();
-            app.working_text = if cancelling {
-                format!(" ✗ cancelling… stops after the current step  {bar}   (Esc again to force-stop)")
-            } else {
-                format!(
-                    " {spin} working{mode_badge}{dots}  {bar}  {}s{activity}   (Esc to cancel)",
-                    started.elapsed().as_secs()
-                )
-            };
-            // The bottom working bar already shows the animated "working" state
-            // (with elapsed time and Esc hint), so DON'T also inject a spinner
-            // placeholder into the transcript — boxed as a bbarit card it looked
-            // like a real message and read as a confusing second "working".
-            // Render a transcript card only once real streamed content exists.
-            let render_partial = if partial.is_empty() {
-                None
-            } else {
-                Some(partial.as_str())
-            };
-            let _ = terminal.draw(|frame| render(frame, app, render_partial));
-            tick += 1;
-            match done_rx.try_recv() {
-                Ok((worker_store, result)) => {
-                    while let Ok(chunk) = rx.try_recv() {
-                        partial.push_str(&chunk);
-                    }
-                    *store = worker_store;
-                    break 'turn result;
+        while let Ok(chunk) = rx.try_recv() {
+            partial.push_str(&chunk);
+            // Don't force follow here: if the user scrolled up to read
+            // earlier output while the agent streams, stay where they are
+            // (follow resumes when they scroll back to the bottom).
+        }
+        // Always-visible animated working indicator in the top bar, with the
+        // current activity (last ⚙/✓/✗ line) so you always see what it's doing.
+        let spin = SPINNER[tick % SPINNER.len()];
+        let bar = working_bar(tick);
+        let dots = ".".repeat(1 + (tick / 2) % 3);
+        let activity = partial
+            .lines()
+            .rev()
+            .find(|line| {
+                let t = line.trim_start();
+                t.starts_with('⚙') || t.starts_with('✓') || t.starts_with('✗')
+            })
+            .map(|line| {
+                let line = line.trim();
+                let preview: String = line.chars().take(48).collect();
+                format!("  ·  {preview}")
+            })
+            .unwrap_or_default();
+        app.working_text = if cancelling {
+            format!(
+                " ✗ cancelling… stops after the current step  {bar}   (Esc again to force-stop)"
+            )
+        } else {
+            format!(
+                " {spin} working{mode_badge}{dots}  {bar}  {}s{activity}   (Esc to cancel)",
+                started.elapsed().as_secs()
+            )
+        };
+        // The bottom working bar already shows the animated "working" state
+        // (with elapsed time and Esc hint), so DON'T also inject a spinner
+        // placeholder into the transcript — boxed as a bbarit card it looked
+        // like a real message and read as a confusing second "working".
+        // Render a transcript card only once real streamed content exists.
+        let render_partial = if partial.is_empty() {
+            None
+        } else {
+            Some(partial.as_str())
+        };
+        let _ = terminal.draw(|frame| render(frame, app, render_partial));
+        tick += 1;
+        match done_rx.try_recv() {
+            Ok((worker_store, result)) => {
+                while let Ok(chunk) = rx.try_recv() {
+                    partial.push_str(&chunk);
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // The worker panicked and its store went down with it —
-                    // recover the session from disk so the TUI can continue.
-                    if let Some(path) = &session_path
-                        && let Ok(reloaded) = SessionStore::reopen(path.clone())
-                    {
-                        *store = reloaded;
-                    }
-                    break 'turn Err(anyhow::anyhow!("turn thread panicked"));
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
+                *store = worker_store;
+                break 'turn result;
             }
-            // Accept input while the turn runs: Esc cancels (after the current
-            // call), Enter queues a follow-up, paste/keys edit the input line.
-            {
-                // Same drain-before-redraw as the idle loop: one full-frame
-                // redraw per character made typing crawl while a turn streamed.
-                // next_events also reassembles bracketed pastes, so pasting
-                // mid-turn can no longer read as Esc (= cancel).
-                for event in next_events(Duration::from_millis(80)).unwrap_or_default() {
-                    match event {
-                        Event::Paste(text) => app.input.push_str(&text),
-                        // Wheel scroll + drag-select/copy keep working while streaming.
-                        Event::Mouse(mouse) => {
-                            let render_partial = if partial.is_empty() {
-                                None
-                            } else {
-                                Some(partial.as_str())
-                            };
-                            handle_transcript_mouse(app, mouse, render_partial);
-                        }
-                        Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            if is_turn_cancel_key(key.code, key.modifiers) {
-                                if cancelling {
-                                    // Second Esc while already cancelling: hard
-                                    // abort. Stop waiting for the worker, bump
-                                    // the epoch (the orphan sees itself as
-                                    // cancelled forever and stops writing the
-                                    // session file), reload the session from
-                                    // disk, and hand the UI back immediately.
-                                    crate::commands::abandon_current_turn();
-                                    if let Some(path) = &session_path
-                                        && let Ok(reloaded) = SessionStore::reopen(path.clone())
-                                    {
-                                        *store = reloaded;
-                                    }
-                                    break 'turn Ok(
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The worker panicked and its store went down with it —
+                // recover the session from disk so the TUI can continue.
+                if let Some(path) = &session_path
+                    && let Ok(reloaded) = SessionStore::reopen(path.clone())
+                {
+                    *store = reloaded;
+                }
+                break 'turn Err(anyhow::anyhow!("turn thread panicked"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        // Accept input while the turn runs: Esc cancels (after the current
+        // call), Enter queues a follow-up, paste/keys edit the input line.
+        {
+            // Same drain-before-redraw as the idle loop: one full-frame
+            // redraw per character made typing crawl while a turn streamed.
+            // next_events also reassembles bracketed pastes, so pasting
+            // mid-turn can no longer read as Esc (= cancel).
+            for event in next_events(Duration::from_millis(80)).unwrap_or_default() {
+                match event {
+                    Event::Paste(text) => app.input.push_str(&text),
+                    // Wheel scroll + drag-select/copy keep working while streaming.
+                    Event::Mouse(mouse) => {
+                        let render_partial = if partial.is_empty() {
+                            None
+                        } else {
+                            Some(partial.as_str())
+                        };
+                        handle_transcript_mouse(app, mouse, render_partial);
+                    }
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if is_turn_cancel_key(key.code, key.modifiers) {
+                            if cancelling {
+                                // Second Esc while already cancelling: hard
+                                // abort. Stop waiting for the worker, bump
+                                // the epoch (the orphan sees itself as
+                                // cancelled forever and stops writing the
+                                // session file), reload the session from
+                                // disk, and hand the UI back immediately.
+                                crate::commands::abandon_current_turn();
+                                if let Some(path) = &session_path
+                                    && let Ok(reloaded) = SessionStore::reopen(path.clone())
+                                {
+                                    *store = reloaded;
+                                }
+                                break 'turn Ok(
                                         "(force-stopped — abandoned the stalled step; the session continues)"
                                             .to_string(),
                                     );
-                                }
-                                crate::commands::request_cancel();
-                                cancelling = true;
-                                continue;
                             }
-                            match (key.code, key.modifiers) {
-                                (KeyCode::PageUp, _) => app.scroll_up_by(10),
-                                (KeyCode::PageDown, _) => app.scroll_down_by(10),
-                                (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                                    app.input.clear();
-                                }
-                                (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                            crate::commands::request_cancel();
+                            cancelling = true;
+                            continue;
+                        }
+                        match (key.code, key.modifiers) {
+                            (KeyCode::PageUp, _) => app.scroll_up_by(10),
+                            (KeyCode::PageDown, _) => app.scroll_down_by(10),
+                            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                                app.input.clear();
+                            }
+                            (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                                app.entries.clear();
+                                partial.clear();
+                                app.follow = true;
+                                app.scroll = 0;
+                                terminal.clear().ok();
+                            }
+                            (KeyCode::Enter, m)
+                                if m.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                            {
+                                app.input.push('\n');
+                            }
+                            (KeyCode::Enter, _) => {
+                                let text = app.input.trim().to_string();
+                                app.input.clear();
+                                if matches!(text.as_str(), "/clear" | "/cls") {
                                     app.entries.clear();
                                     partial.clear();
                                     app.follow = true;
                                     app.scroll = 0;
                                     terminal.clear().ok();
+                                } else if !text.is_empty() {
+                                    // Input queued mid-turn is also kept in Up/Down history.
+                                    app.record_history(config, &text);
+                                    app.queued.push(text);
                                 }
-                                (KeyCode::Enter, m)
-                                    if m.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-                                {
-                                    app.input.push('\n');
-                                }
-                                (KeyCode::Enter, _) => {
-                                    let text = app.input.trim().to_string();
-                                    app.input.clear();
-                                    if matches!(text.as_str(), "/clear" | "/cls") {
-                                        app.entries.clear();
-                                        partial.clear();
-                                        app.follow = true;
-                                        app.scroll = 0;
-                                        terminal.clear().ok();
-                                    } else if !text.is_empty() {
-                                        // Input queued mid-turn is also kept in Up/Down history.
-                                        app.record_history(config, &text);
-                                        app.queued.push(text);
-                                    }
-                                }
-                                (KeyCode::Backspace, _) => {
-                                    app.input.pop();
-                                }
-                                // Recall previous inputs with Up/Down even mid-turn —
-                                // since the agent running is effectively most of the time,
-                                // having it only in the idle composer would make it feel broken.
-                                (KeyCode::Up, _) => app.history_prev(),
-                                (KeyCode::Down, _) => app.history_next(),
-                                // Don't let an unhandled Ctrl/Alt chord (e.g.
-                                // Alt+1..9, Ctrl+W) type its raw letter mid-turn.
-                                (KeyCode::Char(ch), m)
-                                    if !m.intersects(
-                                        KeyModifiers::CONTROL
-                                            | KeyModifiers::ALT
-                                            | KeyModifiers::SUPER,
-                                    ) =>
-                                {
-                                    app.input.push(ch);
-                                }
-                                _ => {}
                             }
+                            (KeyCode::Backspace, _) => {
+                                app.input.pop();
+                            }
+                            // Recall previous inputs with Up/Down even mid-turn —
+                            // since the agent running is effectively most of the time,
+                            // having it only in the idle composer would make it feel broken.
+                            (KeyCode::Up, _) => app.history_prev(),
+                            (KeyCode::Down, _) => app.history_next(),
+                            // Don't let an unhandled Ctrl/Alt chord (e.g.
+                            // Alt+1..9, Ctrl+W) type its raw letter mid-turn.
+                            (KeyCode::Char(ch), m)
+                                if !m.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                app.input.push(ch);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
-        };
+        }
+    };
 
     match outcome {
         Ok(output) => {

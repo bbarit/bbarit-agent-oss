@@ -2314,7 +2314,8 @@ pub fn worker_abandoned() -> bool {
 #[cfg(test)]
 pub(crate) fn epoch_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Request cooperative cancellation of the running agent loop. The loop stops
@@ -6891,7 +6892,10 @@ mod tests {
 
         assert!(!before_abort, "worker must start uncancelled");
         assert!(after_abort, "epoch bump must cancel the abandoned worker");
-        assert!(after_reset, "reset_cancel must not revive an abandoned worker");
+        assert!(
+            after_reset,
+            "reset_cancel must not revive an abandoned worker"
+        );
         assert!(
             !cancel_requested(),
             "the UI thread (no worker epoch) must be unaffected by the abort"
