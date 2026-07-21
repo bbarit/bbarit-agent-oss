@@ -2453,6 +2453,9 @@ pub fn run_interactive(
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // Stop signals (SIGTTIN after a child steals the tty, external SIGTSTP)
+    // must not leave the shell with mouse tracking / alt screen still on.
+    tty_guard::install();
     // On panic, restore the terminal first so the error is visible and the shell
     // is usable (otherwise a panic leaves a raw/alt-screen "dead" terminal).
     let default_hook = std::panic::take_hook();
@@ -2628,6 +2631,9 @@ fn run_app(
     // never appear. Surface it on the first frame after the check arrives.
     let mut update_hint_shown = crate::update::available_update().is_some();
     while !app.exit {
+        if tty_guard::take_resumed() {
+            reenter_tui(terminal);
+        }
         if !update_hint_shown && let Some(version) = crate::update::available_update() {
             app.entries.push(Entry::new(
                 Kind::System,
@@ -2801,9 +2807,143 @@ impl PasteReassembly {
     }
 }
 
+/// Job-control safety net (unix). Long sessions occasionally lose the tty: a
+/// spawned child (or an orphan it left behind) makes itself the terminal's
+/// foreground process group and exits, leaving the TUI in the background — its
+/// next tty read stops the whole process with SIGTTIN. No exit path runs on a
+/// stop signal, so the host shell gets the prompt back with mouse tracking and
+/// the alternate screen still on, and every wheel tick spews "65;91;14M"-style
+/// SGR mouse reports into the prompt.
+#[cfg(unix)]
+mod tty_guard {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Undo everything the TUI turned on, as one static blob a signal handler
+    /// can `write(2)` as-is: SGR/any-motion/button/normal mouse tracking off,
+    /// bracketed paste off, alternate screen off, cursor visible. Termios is
+    /// left to the shell — zsh/bash reset their own modes at the prompt; the
+    /// leak lives in the emulator, and this is what turns it off.
+    const RESTORE: &[u8] =
+        b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h";
+
+    static RESUMED: AtomicBool = AtomicBool::new(false);
+
+    fn handler(f: extern "C" fn(libc::c_int)) -> libc::sighandler_t {
+        f as *const () as libc::sighandler_t
+    }
+
+    extern "C" fn on_stop(sig: libc::c_int) {
+        unsafe {
+            let _ = libc::write(libc::STDOUT_FILENO, RESTORE.as_ptr().cast(), RESTORE.len());
+            // Stop for real with the default action (the handled signal is
+            // blocked until the handler returns, so the re-raise lands as the
+            // default stop right after). on_cont reinstalls the handlers.
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    extern "C" fn on_cont(_: libc::c_int) {
+        RESUMED.store(true, Ordering::SeqCst);
+        unsafe {
+            libc::signal(libc::SIGTSTP, handler(on_stop));
+            libc::signal(libc::SIGTTIN, handler(on_stop));
+            libc::signal(libc::SIGTTOU, handler(on_stop));
+        }
+    }
+
+    pub(super) fn install() {
+        unsafe {
+            libc::signal(libc::SIGTSTP, handler(on_stop));
+            libc::signal(libc::SIGTTIN, handler(on_stop));
+            libc::signal(libc::SIGTTOU, handler(on_stop));
+            libc::signal(libc::SIGCONT, handler(on_cont));
+        }
+    }
+
+    /// True once after a SIGCONT (`fg` following a stop); the caller re-enters
+    /// raw mode + alt screen + mouse capture and repaints.
+    pub(super) fn take_resumed() -> bool {
+        RESUMED.swap(false, Ordering::SeqCst)
+    }
+
+    /// If the terminal's foreground pgrp is a dead group — the thief exited
+    /// without giving the tty back — reclaim it before the next read turns
+    /// into a SIGTTIN stop. A LIVE foreground group is never touched: it may
+    /// be the host shell (e.g. after `bg`), and stealing from it would hijack
+    /// the user's prompt; against a live thief the read stops us via on_stop,
+    /// which restores the terminal first.
+    pub(super) fn reclaim_foreground() {
+        unsafe {
+            let ours = libc::getpgrp();
+            let fg = libc::tcgetpgrp(libc::STDIN_FILENO);
+            if fg <= 0 || fg == ours {
+                return;
+            }
+            if libc::killpg(fg, 0) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                // tcsetpgrp from the background raises SIGTTOU unless ignored.
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                let _ = libc::tcsetpgrp(libc::STDIN_FILENO, ours);
+                libc::signal(libc::SIGTTOU, handler(on_stop));
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod tty_guard {
+    pub(super) fn install() {}
+    pub(super) fn take_resumed() -> bool {
+        false
+    }
+    pub(super) fn reclaim_foreground() {}
+}
+
+/// Re-enter the TUI's terminal modes after a SIGCONT (`fg` following a stop):
+/// the stop handler turned everything off and the host shell may have reset
+/// more. The full clear forces ratatui to repaint every cell.
+fn reenter_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    let _ = enable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    );
+    let _ = terminal.clear();
+}
+
+/// Hard-wrap `text` into visual rows by display width, the way a terminal
+/// does: a wide char (CJK etc.) never straddles the boundary. The composer
+/// renders these rows verbatim and derives the row count AND the cursor
+/// position from them, so the hardware cursor — where the terminal anchors
+/// the IME preedit — always lands exactly at the end of the text.
+fn wrap_visual_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0usize;
+        for ch in line.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(ch);
+            used += w;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Wait up to `first_wait` for input, then drain the whole queued burst
 /// (reassembling bracketed pastes) so one redraw covers many characters.
 fn next_events(first_wait: Duration) -> io::Result<Vec<Event>> {
+    tty_guard::reclaim_foreground();
     let mut out = Vec::new();
     if !event::poll(first_wait)? {
         return Ok(out);
@@ -3673,6 +3813,9 @@ fn run_single_turn(
         } else {
             Some(partial.as_str())
         };
+        if tty_guard::take_resumed() {
+            reenter_tui(terminal);
+        }
         let _ = terminal.draw(|frame| render(frame, app, render_partial));
         tick += 1;
         match done_rx.try_recv() {
@@ -3876,13 +4019,14 @@ fn render(frame: &mut Frame, app: &mut App, partial: Option<&str>) {
 
     // Input box grows with multiline content (Alt/Shift+Enter, multi-line paste),
     // up to 8 rows + border. Long lines wrap, so count VISUAL rows, not '\n's.
+    // The SAME pre-wrapped rows feed the renderer, the row count, and the
+    // cursor math below — Paragraph::wrap word-wraps at different points than
+    // any width-modulo estimate, and every divergence walked the hardware
+    // cursor (= where the terminal anchors the IME preedit) left of the real
+    // text end, so Hangul composition overlapped and drifted left.
     let input_inner_w = area.width.saturating_sub(2).max(1) as usize;
-    let input_lines: u16 = app
-        .input
-        .split('\n')
-        .map(|l| (UnicodeWidthStr::width(l) / input_inner_w) as u16 + 1)
-        .sum::<u16>()
-        .max(1);
+    let input_rows = wrap_visual_rows(&app.input, input_inner_w);
+    let input_lines: u16 = (input_rows.len() as u16).max(1);
     let input_h = (input_lines + 2).min(10);
 
     // Messages typed while the agent is working wait in a queue; show them so
@@ -4233,25 +4377,26 @@ fn render(frame: &mut Frame, app: &mut App, partial: Option<&str>) {
         .border_style(Style::new().fg(border_tone))
         .title(title)
         .title_style(Style::new().fg(CARD_FRAME));
+    // Rendered from the pre-wrapped rows WITHOUT Paragraph::wrap: the widget's
+    // word-wrapper breaks lines at different points than the row/cursor math,
+    // and any mismatch mis-anchors the IME preedit (Hangul composition
+    // overlapping and drifting left).
     let input_paragraph = if app.input.is_empty() {
         Paragraph::new(Span::styled(
             "Ask anything — /help for commands",
             Style::new().fg(CARD_FRAME).add_modifier(Modifier::ITALIC),
         ))
     } else {
-        Paragraph::new(app.input.as_str())
+        Paragraph::new(input_rows.join("\n"))
     };
     frame.render_widget(
-        input_paragraph
-            .wrap(Wrap { trim: false })
-            .scroll((input_scroll, 0))
-            .block(input_block),
+        input_paragraph.scroll((input_scroll, 0)).block(input_block),
         input,
     );
     // Cursor sits at the end of the last VISUAL row (wrapped rows counted).
-    let last_line = app.input.split('\n').next_back().unwrap_or("");
+    let last_row = input_rows.last().map(String::as_str).unwrap_or("");
     let row = input_lines.saturating_sub(1).saturating_sub(input_scroll);
-    let cursor_x = (input.x + 1 + (UnicodeWidthStr::width(last_line) % input_inner_w) as u16)
+    let cursor_x = (input.x + 1 + UnicodeWidthStr::width(last_row) as u16)
         .min(input.x + input.width.saturating_sub(2));
     frame.set_cursor_position(Position::new(
         cursor_x.min(area.right().saturating_sub(1)),
@@ -5870,6 +6015,35 @@ mod tests {
         let mut out = vec![key(KeyCode::Esc)];
         out.extend(chars.map(|c| key(KeyCode::Char(c))));
         out
+    }
+
+    #[test]
+    fn wrap_visual_rows_keeps_wide_chars_whole_at_the_boundary() {
+        // Odd width: 2-cell Hangul can't fill the last column, so each row
+        // holds 2 chars (4 cells), never a straddled half-char. The
+        // width-modulo formula this replaced assumed 5 cells/row and walked
+        // the cursor left.
+        let rows = wrap_visual_rows("가나다라마", 5);
+        assert_eq!(rows, vec!["가나", "다라", "마"]);
+        for row in &rows {
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 5);
+        }
+    }
+
+    #[test]
+    fn wrap_visual_rows_matches_terminal_char_wrapping_for_ascii() {
+        assert_eq!(wrap_visual_rows("abcdefg", 3), vec!["abc", "def", "g"]);
+        // Exactly full row: no phantom empty row after it.
+        assert_eq!(wrap_visual_rows("abcdef", 3), vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn wrap_visual_rows_preserves_newlines_and_content() {
+        assert_eq!(wrap_visual_rows("", 10), vec![""]);
+        assert_eq!(wrap_visual_rows("ab\n", 10), vec!["ab", ""]);
+        let rows = wrap_visual_rows("안녕하세요 반갑습니다\nsecond line", 8);
+        // Rejoining loses only the wrap points — no character is dropped.
+        assert_eq!(rows.concat(), "안녕하세요 반갑습니다second line");
     }
 
     #[test]
